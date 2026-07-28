@@ -1,0 +1,14 @@
+# Minimal dependencies for the packaged backend (PyInstaller build).
+# Keep this slim: everything here ends up inside backend.exe.
+flask
+flask_cors
+moviepy
+requests
+faster-whisper
+pandas
+openpyxl
+python-dotenv
+
+# NOTE: g4f is deliberately absent and must never be added here (or to any
+# other requirements file) - it must never install automatically with
+# Hi-Lite. See CONTRIBUTING.md "Custom third-party providers".

@@ -1,0 +1,17 @@
+{
+  "name": "Hi-Lite (backend + web)",
+  "dockerComposeFile": ["../compose/docker-compose.yml"],
+  "service": "hilite",
+  "workspaceFolder": "/app",
+  "shutdownAction": "stopCompose",
+  "forwardPorts": [8000, 5173],
+  "portsAttributes": {
+    "8000": { "label": "Backend (Flask)" },
+    "5173": { "label": "Frontend (Vite, use this one)" }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python", "dbaeumer.vscode-eslint"]
+    }
+  }
+}

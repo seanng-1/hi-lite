@@ -1,0 +1,65 @@
+{
+  "name": "hi-lite-electron",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k \"tsc -w -p tsconfig.json\" \"wait-on dist/main.js && electron .\"",
+    "build": "tsc -p tsconfig.json",
+    "start": "electron .",
+    "dist": "electron-builder --win nsis"
+  },
+  "dependencies": {
+    "tree-kill": "^1.2.2",
+    "wait-on": "^7.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.4",
+    "concurrently": "^9.0.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5",
+    "electron": "^31.3.1",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.hi-lite.app",
+    "productName": "Hi-Lite",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "../web/dist/**"
+    ],
+    "extraResources": [
+      {
+        "from": "../web/dist",
+        "to": "web/dist"
+      },
+      {
+        "from": "../backend-dist/backend.exe",
+        "to": "backend.exe"
+      },
+      {
+        "from": "../bin/",
+        "to": "bin",
+        "filter": ["ffmpeg.exe", "ffprobe.exe", "ffmpeg", "ffprobe"]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false
+    }
+  }
+}

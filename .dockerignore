@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+venv/
+whishper_data/
+whishper/
+whisper_models/
+node_modules/
+*.log
+.git/
+.env

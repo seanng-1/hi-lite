@@ -1,0 +1,21 @@
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+
+# Ignore virtual environments
+venv/
+
+# Ignore Whispher data / external services
+whishper_data/
+whishper/
+whisper_models/
+
+# Additional ignores
+node_modules/
+*.log
+.git/
+.env
+compose/

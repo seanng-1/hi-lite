@@ -1,0 +1,24 @@
+# Explicit project name: the default (this directory's name, "compose") is
+# too generic and collides with other compose projects on the same machine
+name: hilite
+
+services:
+  hilite:
+    build:
+      context: ..
+      dockerfile: compose/Dockerfile
+    container_name: hilite
+    ports:
+      - "8000:8000" # Flask backend
+      - "5173:5173" # Vite frontend
+    volumes:
+      - ..:/app
+      - /app/web/node_modules
+    environment:
+      # Disable Flask reloader in Docker to prevent process forking that resets global state
+      - FLASK_USE_RELOADER=false
+      # Pass through from the host, e.g. WHISPER_MODEL=tiny docker compose up
+      - WHISPER_MODEL=${WHISPER_MODEL:-small}
+    # Run as host user so uploads/, highlights/, whisper_models/ written into
+    # the bind mount aren't root-owned on the host
+    user: "1000:1000"

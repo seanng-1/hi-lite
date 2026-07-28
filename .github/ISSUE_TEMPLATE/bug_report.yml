@@ -1,0 +1,50 @@
+name: Bug report
+description: Something broke or behaved unexpectedly
+labels: [bug]
+body:
+  - type: dropdown
+    id: environment
+    attributes:
+      label: How are you running Hi-Lite?
+      options:
+        - Installed Windows app (from Releases)
+        - Dev servers (web_interface.py + npm run dev)
+        - Docker (compose/)
+        - Pipeline CLI (main.py)
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: App version / commit
+      description: Installer version (e.g. 0.1.0) or git commit for dev setups
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: e.g. Windows 11 23H2, Ubuntu 24.04 (WSL2)
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / errors
+      description: >
+        For the installed Windows app, data and logs live under
+        `%APPDATA%\hi-lite-electron`. Paste any error output or the processing
+        status shown in the UI. Console output for dev setups.
+      render: text
+  - type: input
+    id: video-details
+    attributes:
+      label: Input video details (if processing-related)
+      placeholder: e.g. 20 min 1080p mp4 (h264/aac), ~1.5 GB

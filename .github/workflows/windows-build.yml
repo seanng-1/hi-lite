@@ -1,0 +1,95 @@
+name: Windows Installer
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+  release:
+    types: [ published ]
+
+jobs:
+  build-win:
+    runs-on: windows-latest
+    permissions:
+      contents: write  # needed to attach the installer to a Release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python deps + PyInstaller
+        # requirements-backend.txt, NOT requirements.txt: the full dev set
+        # (torch, g4f, spacy, ...) would be bundled into backend.exe and
+        # balloon it to gigabytes. backend.spec also excludes them.
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements-backend.txt
+          pip install pyinstaller
+
+      # build web UI before PyInstaller
+      - name: Build web UI
+        shell: bash
+        run: |
+          cd web
+          npm ci
+          npm run build
+          echo "=== Web build complete ==="
+          ls -la dist/
+
+      # web/dist should now exist
+      - name: Build backend.exe
+        shell: bash
+        run: |
+          echo "=== Checking web/dist before PyInstaller ==="
+          ls -la web/dist/ 
+          
+          pyinstaller --clean --distpath backend-dist backend.spec
+          
+          ls -la backend-dist
+
+      - name: Download ffmpeg (win64)
+        shell: bash
+        run: |
+          mkdir -p bin
+          curl -L -o ffmpeg.zip https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+          powershell -Command "Expand-Archive -Path ffmpeg.zip -DestinationPath .\ffmpeg_extracted"
+          FFMPEG_DIR=$(find ffmpeg_extracted -type d -name 'ffmpeg-*' | head -n1)
+          cp "$FFMPEG_DIR"/bin/ffmpeg.exe bin/
+          cp "$FFMPEG_DIR"/bin/ffprobe.exe bin/
+          ls -la bin
+
+      - name: Build Electron installer (NSIS)
+        shell: bash
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          cd electron
+          npm ci
+          npm run build
+          npm run dist
+          ls -la release
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hi-lite-windows-installer
+          path: electron/release/*
+
+      # On a published GitHub Release (tag vX.Y.Z), attach the installer as a
+      # release asset. Version source of truth is electron/package.json.
+      - name: Attach installer to release
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            electron/release/*.exe --clobber

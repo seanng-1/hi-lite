@@ -1,0 +1,4 @@
+# Dev requirements are identical to the packaged backend's runtime deps.
+# Add new runtime dependencies to requirements-backend.txt (they end up
+# inside backend.exe); keep heavy experimental deps out of both.
+-r requirements-backend.txt
