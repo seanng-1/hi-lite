@@ -66,6 +66,17 @@ jobs:
           cp "$FFMPEG_DIR"/bin/ffprobe.exe bin/
           ls -la bin
 
+      # Keep the installer's version in lockstep with the release tag so the
+      # asset name (Hi-Lite Setup X.Y.Z.exe) can never drift from vX.Y.Z.
+      - name: Sync version from release tag
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          cd electron
+          npm version --no-git-tag-version "${TAG#v}"
+
       - name: Build Electron installer (NSIS)
         shell: bash
         env:
