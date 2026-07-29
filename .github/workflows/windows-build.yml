@@ -75,7 +75,7 @@ jobs:
           TAG: ${{ github.event.release.tag_name }}
         run: |
           cd electron
-          npm version --no-git-tag-version "${TAG#v}"
+          npm version --no-git-tag-version --allow-same-version "${TAG#v}"
 
       - name: Build Electron installer (NSIS)
         shell: bash
