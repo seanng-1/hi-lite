@@ -67,8 +67,11 @@ is stored on your machine in the app's data directory, never in the browser, and
 ever sent to the base URL you configured.
 
 These two backends — a local model and an OpenAI-compatible API — are the ones Hi-Lite
-ships with built-in support for. Other providers can be wired up for development or
-educational purposes; see ["Custom third-party providers" in
+ships with built-in support for. 
+
+## Testing
+**Other providers** can be wired up for **development** or
+**educational** purposes; see ["Custom third-party providers" in
 CONTRIBUTING.md](CONTRIBUTING.md#custom-third-party-providers) for the walkthrough. You
 are responsible for complying with the terms of service of anything you integrate
 manually.
