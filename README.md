@@ -10,7 +10,8 @@ the clips for you, using a backend *you* choose: a model running on your own mac
 (fully offline), or an OpenAI-compatible API with your own key. See
 [What leaves your machine](#what-leaves-your-machine).
 
-<img width="1914" alt="Upload screen" src="https://github.com/user-attachments/assets/558b258a-b18a-4171-b6d9-0df8bda2ffba" />
+<img width="1914" height="948" alt="Upload screen" src="https://github.com/user-attachments/assets/37dc3d62-dcc6-478a-b714-e511e22fbb68" />
+
 
 ## Install (Windows)
 
@@ -22,14 +23,14 @@ Whisper model (~500 MB) downloads automatically.
 
 1. **Upload** a video — audio is extracted and transcribed locally with word-level timestamps
 2. **Review** — one clip per transcript segment, previewed in the browser
-   <img width="1909" alt="Clip selection" src="https://github.com/user-attachments/assets/7daf7db5-1658-4a02-abda-eb446906fe96" />
+   <img width="1909" height="943" alt="Clip selection" src="https://github.com/user-attachments/assets/366961f6-7b86-49f6-8ba5-76ceb036768d" />
 3. **Select** clips manually — fully offline — or hit **Auto-Generate** to have an LLM
    score every segment against your own criteria ("clutch rounds and funny moments
    only"). Scoring runs on a local model or your own API account; see
    [Auto-Generate setup](#auto-generate-setup)
-   <img width="1914" alt="Auto-generate" src="https://github.com/user-attachments/assets/8085ae1b-21eb-4a45-bc76-8898cbb30745" />
+   <img width="1914" height="947" alt="Auto-generate" src="https://github.com/user-attachments/assets/9022393a-3fa0-4346-a47a-f9ce59609478" />
 4. **Export** — clips are stitched into a single mp4 you can download
-   <img width="1911" alt="Export" src="https://github.com/user-attachments/assets/966c7890-a81c-4c7a-abc0-4ab4518eaa5a" />
+   <img width="1911" height="945" alt="Export" src="https://github.com/user-attachments/assets/981f5132-50ee-49eb-a5fe-800cbf3921d0" />
 
 ## What leaves your machine
 
