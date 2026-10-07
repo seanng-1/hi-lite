@@ -174,6 +174,7 @@ def extract_all_segments_alternative(video_path, transcription_data, output_fold
             if result.returncode == 0 and os.path.exists(segment_path) and os.path.getsize(segment_path) > 0:
                 segment_files.append({
                     "id": i,
+                    "transcript_id": segment.get("id"),
                     "filename": segment_filename,
                     "path": segment_path,
                     "start": start_time,
@@ -351,6 +352,7 @@ def extract_all_segments(video_path, transcription_data, output_folder):
                     if success and os.path.exists(segment_path) and os.path.getsize(segment_path) > 0:
                         segment_files.append({
                             "id": i,
+                            "transcript_id": segment.get("id"),
                             "filename": segment_filename,
                             "path": segment_path,
                             "start": start_time,

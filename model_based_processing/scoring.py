@@ -33,12 +33,16 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 # responds, else `api` if a key is configured, else scoring fails with an
 # explanatory message. There is never an implicit fallback to g4f.
 
+import hashlib
 import json
+import math
 import os
 import re
 import sys
+import tempfile
 import time
 from typing import List, Dict, Tuple, Optional
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 # This script's output is piped into the backend on Windows (cp1252 default):
 # force UTF-8 and line buffering so prints can't crash or stall the pipe.
@@ -61,9 +65,10 @@ class ScoringError(Exception):
     server can surface distinct messages instead of a blanket failure.
     """
 
-    def __init__(self, message: str, category: str = "api"):
+    def __init__(self, message: str, category: str = "api", diagnostics: Optional[Dict] = None):
         super().__init__(message)
         self.category = category
+        self.diagnostics = diagnostics
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +138,81 @@ def get_llm_settings() -> Dict:
 # Backend-independent prompt / parsing / enrichment
 # ---------------------------------------------------------------------------
 
+# Bump this when the scoring prompt/response semantics intentionally change.
+SCORING_PROMPT_VERSION = "1"
+
+
+def _append_endpoint_path(base_url: str, path: str) -> str:
+    """Append the request route to the path, keeping credentials in the query."""
+    parts = urlsplit(base_url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/") + path,
+                       parts.query, ""))
+
+
+def endpoint_identity(base_url: str) -> str:
+    """Nonsecret server/path identity. Untyped URL queries may contain secrets."""
+    try:
+        parts = urlsplit(base_url)
+        if not parts.scheme or not parts.netloc:
+            raise ValueError
+        # Preserve path spelling/case and internal slashes; only trailing
+        # slashes are ignored, as in _append_endpoint_path's actual request.
+        return urlunsplit((parts.scheme, parts.netloc.rsplit("@", 1)[-1],
+                           parts.path.rstrip("/"), "", ""))
+    except ValueError:
+        raise ScoringError("The scoring endpoint URL is invalid.", category="config") from None
+
+
+def _endpoint_query_reusable(base_url: str) -> bool:
+    """Unknown query fields may route requests; never guess or persist their values."""
+    credential_fields = {"key", "api_key", "api-key", "apikey", "token", "access_token",
+                         "access-token", "api_token", "auth", "authorization", "bearer",
+                         "password", "secret", "signature", "sig", "credential", "credentials"}
+    return all(name.lower() in credential_fields for name, _ in
+               parse_qsl(urlsplit(base_url).query, keep_blank_values=True))
+
+
+def transcript_digest(segments: List[Dict]) -> str:
+    """Hash the ordered authoritative scoring segments, not the clip manifest."""
+    try:
+        if not isinstance(segments, list) or not segments:
+            raise ValueError
+        records = []
+        for segment in segments:
+            sid = canonical_segment_id(segment.get("id"))
+            if sid is None or not isinstance(segment["text"], str):
+                raise ValueError
+            records.append({"id": sid, "text": segment["text"].strip(),
+                            "start": float(segment["start"]), "end": float(segment["end"])})
+        serialized = json.dumps(records, ensure_ascii=False, sort_keys=True,
+                                separators=(",", ":"), allow_nan=False)
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+        raise ScoringError("Current transcript cannot identify a scoring request.",
+                           category="parse") from None
+
+
+def score_cache_identity(segments, instructions, backend) -> Dict:
+    """Use the resolved backend's request fields; never serialize settings/keys."""
+    criteria = (instructions or "").strip()
+    if not criteria:
+        raise ScoringError("Highlight instructions are required.", category="config")
+    model = getattr(backend, "model", None)
+    provider = getattr(backend, "provider", None)
+    base_url = getattr(backend, "base_url", None)
+    return {
+        "transcript_digest": transcript_digest(segments),
+        "criteria": criteria,
+        "backend": backend.name,
+        "provider": provider if isinstance(provider, str) else None,
+        "endpoint": endpoint_identity(base_url) if isinstance(base_url, str) else None,
+        "endpoint_query_reusable": (_endpoint_query_reusable(base_url)
+                                     if isinstance(base_url, str) else True),
+        "model": model if isinstance(model, str) and model else None,
+        "prompt_version": SCORING_PROMPT_VERSION,
+    }
+
+
 def build_prompt(transcript: str, instructions: str) -> str:
     """
     Build the scoring prompt. `instructions` is required free-form user
@@ -171,43 +251,218 @@ def extract_scored_segments(result_text: str) -> Optional[List[Dict]]:
     Pull the {"segments": [...]} payload out of a model response, tolerating
     surrounding prose/fences. Returns None when no usable JSON is found.
     """
-    if not result_text:
+    if not isinstance(result_text, str) or not result_text:
         return None
     json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
     if not json_match:
         return None
     try:
         result = json.loads(json_match.group())
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         return None
     segments = result.get("segments") if isinstance(result, dict) else None
-    if isinstance(segments, list) and len(segments) > 0:
+    if isinstance(segments, list):
         return segments
     return None
 
 
+class ScoringResult(list):
+    """Keep the backend's list contract while carrying bounded validation diagnostics."""
+
+    def __init__(self, records, validation):
+        super().__init__(records)
+        self.validation = validation
+
+
+def canonical_segment_id(value):
+    """Exact transcript identity; quoted integer IDs are allowed, guessing is not."""
+    if type(value) is int and value >= 0:
+        try:
+            return str(value)
+        except ValueError:  # Python's oversized integer-string limit.
+            return None
+    if isinstance(value, str) and value and value == value.strip():
+        return value
+    return None
+
+
+def validate_scored_segments(scored_segments, segments) -> ScoringResult:
+    """
+    Provider-neutral boundary, also used for disk payloads before enrichment.
+    Scores are JSON numbers (not booleans or strings), finite and within 1-10.
+    Keep the highest valid score per exact ID; first occurrence fixes order and
+    the first record wins equal-score ties. Never invent scores for omissions.
+    """
+    if not isinstance(scored_segments, list):
+        raise ScoringError("Score response must contain a list of segment records.", category="parse")
+    if not isinstance(segments, list) or not segments:
+        raise ScoringError("Current transcript has no segment identities to validate scores against.",
+                           category="parse")
+
+    lookup = {}
+    ambiguous = set()
+    invalid_transcript_ids = 0
+    for segment in segments:
+        sid = canonical_segment_id(segment.get("id")) if isinstance(segment, dict) else None
+        if sid is None:
+            invalid_transcript_ids += 1
+        elif sid in lookup:
+            ambiguous.add(sid)
+        else:
+            lookup[sid] = segment
+
+    accepted = {}
+    rejection_counts = {}
+    rejection_examples = []
+    duplicate_records = 0
+    for index, record in enumerate(scored_segments):
+        problem = None
+        sid = None
+        if not isinstance(record, dict):
+            problem = "malformed_record"
+        elif "segment_id" not in record:
+            problem = "missing_id"
+        else:
+            sid = canonical_segment_id(record["segment_id"])
+            if sid is None:
+                problem = "malformed_id"
+            elif sid in ambiguous:
+                problem = "ambiguous_id"
+            elif sid not in lookup:
+                problem = "unknown_id"
+            elif "score" not in record:
+                problem = "missing_score"
+            elif type(record["score"]) not in (int, float):
+                problem = "invalid_score_type"
+            elif type(record["score"]) is float and not math.isfinite(record["score"]):
+                problem = "nonfinite_score"
+            elif not 1 <= record["score"] <= 10:
+                # Range check before normalization avoids huge-integer overflow.
+                problem = "invalid_score_range"
+
+        if problem:
+            rejection_counts[problem] = rejection_counts.get(problem, 0) + 1
+            if len(rejection_examples) < 10:
+                # No raw provider values, reasons, or secret configuration.
+                rejection_examples.append({"record_index": index, "problem": problem})
+            continue
+
+        normalized = {
+            "segment_id": lookup[sid]["id"],
+            "score": float(record["score"]),
+            "reason": record.get("reason") if isinstance(record.get("reason"), str)
+                      else "No reason provided",
+        }
+        if sid in accepted:
+            duplicate_records += 1
+            if normalized["score"] <= accepted[sid]["score"]:
+                continue
+        accepted[sid] = normalized
+
+    missing = [sid for sid in lookup if sid not in accepted]
+    validation = {
+        "status": "complete" if len(accepted) == len(segments) else "partial",
+        "total_segments": len(segments),
+        "scored_segments": len(accepted),
+        "missing_segment_count": len(missing),
+        "missing_segment_ids": [lookup[sid]["id"] for sid in missing[:10]],
+        "ambiguous_transcript_id_count": len(ambiguous),
+        "invalid_transcript_id_count": invalid_transcript_ids,
+        "rejected_records": sum(rejection_counts.values()),
+        "rejection_counts": rejection_counts,
+        "rejection_examples": rejection_examples,
+        "duplicate_records": duplicate_records,
+    }
+    if not accepted:
+        validation["status"] = "unusable"
+        raise ScoringError("No usable AI scores remain after validation "
+                           f"({validation['rejected_records']} records rejected).",
+                           category="parse", diagnostics=validation)
+    return ScoringResult(accepted.values(), validation)
+
+
 def enrich_results(scored_segments: List[Dict], segments: List[Dict]) -> List[Dict]:
     """
-    Join model scores back onto the original segment data and sort by score.
-    Compare ids as strings: our transcriber uses integer ids and the model
-    may echo them back quoted.
+    Validate before joining onto transcript data or sorting. All providers
+    and cached-score readers share this boundary; provider times/text are ignored.
     """
-    segment_lookup = {str(seg['id']): seg for seg in segments}
-    enriched_results = []
-    for scored_segment in scored_segments:
-        segment_id = str(scored_segment.get('segment_id'))
-        if segment_id in segment_lookup:
-            original = segment_lookup[segment_id]
-            enriched_results.append({
-                "segment_id": original['id'],
-                "start_time": original['start'],
-                "end_time": original['end'],
-                "text": original['text'].strip(),
-                "score": scored_segment.get('score', 5),
-                "reason": scored_segment.get('reason', 'No reason provided')
-            })
+    validated = validate_scored_segments(scored_segments, segments)
+    segment_lookup = {canonical_segment_id(seg['id']): seg for seg in segments
+                      if isinstance(seg, dict) and canonical_segment_id(seg.get('id')) is not None}
+    enriched_results = ScoringResult([], validated.validation)
+    for scored_segment in validated:
+        original = segment_lookup[canonical_segment_id(scored_segment['segment_id'])]
+        enriched_results.append({
+            **scored_segment,
+            "start_time": original['start'],
+            "end_time": original['end'],
+            "text": original['text'].strip(),
+        })
     enriched_results.sort(key=lambda x: x['score'], reverse=True)
     return enriched_results
+
+
+def _read_scored_payload(file_path: str) -> Dict:
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        raise ScoringError("Cached AI scores could not be read as JSON. Run AI scoring again.",
+                           category="parse")
+    if not isinstance(payload, dict) or not isinstance(payload.get("highlights"), list):
+        raise ScoringError("Cached AI scores must contain a highlights list. Run AI scoring again.",
+                           category="parse")
+    return payload
+
+
+def load_scored_results(file_path: str, segments: List[Dict]) -> ScoringResult:
+    """Structural HL-A3a boundary; this alone does not establish cache applicability."""
+    return enrich_results(_read_scored_payload(file_path)["highlights"], segments)
+
+
+def load_score_cache(file_path, segments, identity, *, require_complete=True) -> ScoringResult:
+    """One applicability decision for generation and preview; a miss raises ScoringError.
+
+    Only the just-completed scoring job may consume partial/non-reusable results
+    with require_complete=False. Automatic reuse always requires an effective model.
+    """
+    payload = _read_scored_payload(file_path)
+    cache = payload.get("cache")
+    if (not isinstance(cache, dict) or set(cache) != {"identity", "complete"}
+            or not isinstance(cache.get("identity"), dict)
+            or cache["identity"] != identity or type(cache.get("complete")) is not bool):
+        raise ScoringError("Cached AI scores do not match this scoring request. Run AI scoring again.",
+                           category="parse")
+    if require_complete and (not cache["complete"] or not identity["model"]
+                             or not identity["endpoint_query_reusable"]):
+        raise ScoringError("Cached AI scores are not a complete reusable result. Run AI scoring again.",
+                           category="parse")
+    result = enrich_results(payload["highlights"], segments)
+    if (cache["complete"] != (result.validation["status"] == "complete")
+            or result.validation["rejected_records"]):
+        raise ScoringError("Cached AI scores failed validation. Run AI scoring again.",
+                           category="parse", diagnostics=result.validation)
+    return result
+
+
+def _publish_score_payload(file_path, payload):
+    """Publish one finished JSON file; readers see either old or completed scores."""
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False,
+                                         dir=os.path.dirname(file_path),
+                                         prefix=".scores-", suffix=".tmp") as f:
+            temporary_path = f.name
+            json.dump(payload, f, indent=2, allow_nan=False)
+        os.replace(temporary_path, file_path)
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def report_validation(result: ScoringResult):
+    """Counts and bounded record indexes only; never dump a model response."""
+    print("Score validation: " + json.dumps(result.validation))
 
 
 def _run_with_timeout(func, timeout_seconds: int):
@@ -250,7 +505,9 @@ class ScoringBackend:
     def score(self, segments: List[Dict], transcript: str, instructions: str) -> List[Dict]:
         """
         Return the enriched-result list (segment_id, start_time, end_time,
-        text, score, reason), sorted by score descending.
+        text, score, reason), sorted by score descending. Implementations must
+        use enrich_results() before consuming scores, preserving its validation
+        diagnostics (ScoringResult remains compatible with list callers).
         """
         raise NotImplementedError
 
@@ -263,7 +520,8 @@ def _chat_completion(base_url: str, model: str, prompt: str,
     """
     import requests
 
-    url = base_url.rstrip("/") + "/chat/completions"
+    url = _append_endpoint_path(base_url, "/chat/completions")
+    safe_url = endpoint_identity(base_url)
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -280,11 +538,11 @@ def _chat_completion(base_url: str, model: str, prompt: str,
         )
     except requests.exceptions.Timeout:
         raise ScoringError(
-            f"The model at {base_url} did not respond within {timeout}s.",
+            f"The model at {safe_url} did not respond within {timeout}s.",
             category="timeout")
     except requests.exceptions.ConnectionError:
         raise ScoringError(
-            f"Could not connect to {base_url}. Is the server running / the URL correct?",
+            f"Could not connect to {safe_url}. Is the server running / the URL correct?",
             category="connection")
 
     if response.status_code in (401, 403):
@@ -296,7 +554,7 @@ def _chat_completion(base_url: str, model: str, prompt: str,
             category="rate_limit")
     if response.status_code == 404:
         raise ScoringError(
-            f"Endpoint or model not found at {url} (model '{model}'). "
+            f"Endpoint or model not found at {safe_url}/chat/completions (model '{model}'). "
             "Check the base URL and model name.", category="config")
     if response.status_code >= 400:
         # Provider error bodies are useful but can be huge; keep the head.
@@ -341,8 +599,10 @@ class _OpenAICompatibleBackend(ScoringBackend):
                 f"The model ({self.model}) did not return usable JSON scores. "
                 "A larger or more instruction-following model may be needed.",
                 category="parse")
-        print(f"+ Success with {self.model} in {time.time() - t0:.1f}s")
-        return enrich_results(scored, segments)
+        result = enrich_results(scored, segments)
+        report_validation(result)
+        print(f"+ Scoring {result.validation['status']} with {self.model} in {time.time() - t0:.1f}s")
+        return result
 
 
 class APIBackend(_OpenAICompatibleBackend):
@@ -375,7 +635,7 @@ class LocalBackend(_OpenAICompatibleBackend):
 
     def __init__(self, settings: Optional[Dict] = None):
         settings = settings or get_llm_settings()
-        self.base_url = settings["local_url"].rstrip("/") + "/v1"
+        self.base_url = _append_endpoint_path(settings["local_url"], "/v1")
         self.model = settings["local_model"]
 
     @staticmethod
@@ -385,7 +645,7 @@ class LocalBackend(_OpenAICompatibleBackend):
         import requests
 
         settings = settings or get_llm_settings()
-        url = settings["local_url"].rstrip("/") + "/v1/models"
+        url = _append_endpoint_path(settings["local_url"], "/v1/models")
         try:
             return requests.get(url, timeout=timeout).status_code < 500
         except Exception:
@@ -468,8 +728,10 @@ class G4FBackend(ScoringBackend):
 
                 scored = extract_scored_segments(response.choices[0].message.content)
                 if scored is not None:
-                    print(f"+ Success with {model} in {elapsed:.1f}s")
-                    return enrich_results(scored, segments)
+                    result = enrich_results(scored, segments)
+                    report_validation(result)
+                    print(f"+ Scoring {result.validation['status']} with {model} in {elapsed:.1f}s")
+                    return result
 
             except Exception as e:
                 print(f"Failed with {model}" + (f" via {provider_name}" if provider_name else "") + f": {e}")
@@ -491,14 +753,14 @@ NO_BACKEND_MESSAGE = (
     "Manual clip selection works without any of this.")
 
 
-def get_backend(name: Optional[str] = None) -> ScoringBackend:
+def get_backend(name: Optional[str] = None, settings: Optional[Dict] = None) -> ScoringBackend:
     """
     Resolve the scoring backend. Explicit choice (argument or
     HI_LITE_LLM_BACKEND) wins and never falls back to another backend;
     otherwise: `local` if a server responds, else `api` if a key is
     configured, else ScoringError explaining how to set one up.
     """
-    settings = get_llm_settings()
+    settings = settings if settings is not None else get_llm_settings()
     explicit = (name or settings["backend"] or "").strip().lower()
 
     if explicit:
@@ -612,10 +874,19 @@ def run_scoring(transcript_path: str, output_dir: str, instructions: str) -> boo
 
     try:
         backend = get_backend()
+        identity = score_cache_identity(segments, instructions, backend)
         print(f"Using scoring backend: {backend.name}")
         highlights = backend.score(segments, transcript, instructions)
+        # Existing custom backends may return a plain enriched list. They still
+        # need to use enrich_results before internal consumption; guard their
+        # returned records here as well before statistics or persistence.
+        if not isinstance(highlights, ScoringResult):
+            highlights = enrich_results(highlights, segments)
+            report_validation(highlights)
     except ScoringError as e:
         print(f"ERROR: {e}")
+        if e.diagnostics:
+            print("Score validation: " + json.dumps(e.diagnostics))
         return False
     except ValueError as e:
         print(f"ERROR: {e}")
@@ -637,20 +908,25 @@ def run_scoring(transcript_path: str, output_dir: str, instructions: str) -> boo
         "total_segments": len(segments),
         "instructions": instructions,
         "backend": backend.name,
+        "cache": {"identity": identity, "complete": highlights.validation["status"] == "complete"},
+        "validation": highlights.validation,
         "highlights": highlights,
     }
     scored_path = os.path.join(output_dir, "scored_segments.json")
-    with open(scored_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-
     sorted_payload = dict(payload)
     sorted_payload["highlights"] = sorted(highlights, key=lambda h: h["start_time"])
     sorted_path = os.path.join(output_dir, "sorted_segments.json")
-    with open(sorted_path, "w", encoding="utf-8") as f:
-        json.dump(sorted_payload, f, indent=2)
+    try:
+        # The chronological file is the authoritative cache, published last.
+        _publish_score_payload(scored_path, payload)
+        _publish_score_payload(sorted_path, sorted_payload)
+    except (OSError, ValueError):
+        print("ERROR: Could not publish completed AI scores.")
+        return False
 
     print(f"Results saved to {scored_path} and {sorted_path}")
-    print(f"Scoring complete: {len(highlights)} highlights")
+    # Keep the completion marker parsed by web_interface; report coverage separately.
+    print(f"Scoring complete: {len(highlights)} highlights ({highlights.validation['status']} coverage)")
     return True
 
 

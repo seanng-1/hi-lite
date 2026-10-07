@@ -1,0 +1,32 @@
+{
+  "segments": [
+    {
+      "id": 0,
+      "start": 0,
+      "end": 1.5,
+      "duration": 1.5,
+      "filename": "segment_0.mp4",
+      "text": "Amazing goal! <b>not markup</b> & \"quotes\" — café 日本語"
+    },
+    {
+      "id": 4,
+      "start": 1.5,
+      "end": 3,
+      "duration": 1.5,
+      "filename": "segment_4.mp4",
+      "text": "<script>window.__injected = true</script><img src=x onerror=\"window.__injected = true\"> ordinary play"
+    },
+    {
+      "id": 9,
+      "start": 3,
+      "end": 4.5,
+      "duration": 1.5,
+      "filename": "segment_9.mp4",
+      "text": "The WINNER is here. <svg onload=\"window.__injected = true\"></svg>"
+    }
+  ],
+  "keyword_highlights": [
+    { "id": 9, "start": 999, "text": "Different presentation data" },
+    { "id": 0, "start": 999, "text": "Different presentation data" }
+  ]
+}
