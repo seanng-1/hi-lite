@@ -5,6 +5,7 @@ Updated to use modular structure.
 import os
 import sys
 import json
+from transcript_store import invalidate_transcript, publish_transcript
 from datetime import datetime
 
 # Windows consoles/pipes default to cp1252, which cannot encode transcript
@@ -23,6 +24,8 @@ def main(video_input_path, output_folder="highlights", final_output_name="highli
     """
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
+
+    invalidate_transcript(output_folder)
 
     audio_output_path = os.path.join(output_folder, "extracted_audio.wav")
 
@@ -58,8 +61,7 @@ def main(video_input_path, output_folder="highlights", final_output_name="highli
     json_path = os.path.join(output_folder, "transcription.json")
     xlsx_path = os.path.join(output_folder, "transcription.xlsx")
     
-    with open(json_path, "w") as f:
-        json.dump(transcription, f, indent=4)
+    publish_transcript(output_folder, transcription)
     print(f"Transcription saved to {json_path}")
 
     export_segments_to_excel(transcription, xlsx_path)
