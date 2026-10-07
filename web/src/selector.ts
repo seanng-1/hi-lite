@@ -9,7 +9,57 @@ interface Segment {
     is_keyword: boolean;
   }
   
+  function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  }
+
+  function readSegments(data: unknown): Segment[] {
+    if (!isRecord(data) || !Array.isArray(data.segments)) {
+      throw new Error("Invalid manifest: expected an object with a segments array.");
+    }
+
+    const ids = new Set<number>();
+    const segments = data.segments.map((value: unknown, index: number) => {
+      const invalid = () => new Error(`Invalid manifest: segment ${index + 1} has missing or invalid fields.`);
+      if (!isRecord(value)) throw invalid();
+      const { id, start, end, duration, filename, text, is_keyword } = value;
+      if (typeof id !== "number" || !Number.isSafeInteger(id) || id < 0 || ids.has(id) ||
+          typeof start !== "number" || !Number.isFinite(start) || start < 0 ||
+          typeof end !== "number" || !Number.isFinite(end) || end <= start ||
+          typeof duration !== "number" || !Number.isFinite(duration) || duration <= 0 ||
+          typeof filename !== "string" || !filename.trim() || typeof text !== "string" ||
+          (is_keyword !== undefined && typeof is_keyword !== "boolean")) {
+        throw invalid();
+      }
+      // Invalid Unicode in a filename must recover here, before URL encoding
+      // during review rendering can throw.
+      try { encodeURIComponent(filename); } catch { throw invalid(); }
+      ids.add(id);
+      return { id, start, end, duration, filename, text, is_keyword };
+    });
+
+    // Older manifests store copies of matching segments instead of flags.
+    // Only the canonical id links those records to the displayed segments.
+    const keywordIds = new Set<number>();
+    if (segments.some(segment => segment.is_keyword === undefined) && data.keyword_highlights !== undefined) {
+      if (!Array.isArray(data.keyword_highlights)) {
+        throw new Error("Invalid manifest: expected a keyword_highlights array.");
+      }
+      for (const match of data.keyword_highlights) {
+        if (!isRecord(match) || typeof match.id !== "number" || !ids.has(match.id)) {
+          throw new Error("Invalid manifest: keyword highlight has an unknown or missing segment id.");
+        }
+        keywordIds.add(match.id);
+      }
+    }
+    return segments.map(segment => ({
+      ...segment,
+      is_keyword: segment.is_keyword ?? keywordIds.has(segment.id)
+    }));
+  }
+
   async function main() {
+    injectStyles();
     const app = document.getElementById("app")!;
     app.innerHTML = "<h1>Loading...</h1>";
   
@@ -18,26 +68,89 @@ interface Segment {
     let currentVideoId = "default";
   
     try {
-      const response = await fetch("/data/segments_manifest.json");
-      if (!response.ok) throw new Error("No segments found");
-      const data = await response.json();
-      segments = data.segments;
-      if (!Array.isArray(segments)) throw new Error("Invalid segments data");
+      const response = await fetch("/data/segments_manifest.json", { cache: "no-store" });
+      if (response.status === 404) {
+        showUploadInterface();
+        return;
+      }
+      if (!response.ok) throw new Error(`Could not load the recording manifest (HTTP ${response.status}).`);
+      segments = readSegments(await response.json());
     } catch (err) {
-      // No segments available, show upload interface
+      const message = err instanceof Error && !(err instanceof SyntaxError)
+        ? err.message : "The recording manifest could not be read. It may contain invalid JSON.";
+      showUploadInterface(`${message} Upload a recording to try again.`);
+      return;
+    }
+
+    if (segments.length === 0) {
       showUploadInterface();
       return;
     }
-  
-    // Inject CSS
-    injectStyles();
     
     // Build main UI
     buildMainUI(segments, currentVideoId);
   }
   
+  function mountSubtitles(parent: HTMLElement) {
+    const panel = document.createElement("section");
+    panel.style.cssText = "padding:16px;display:flex;gap:12px;flex-wrap:wrap;align-items:center";
+    panel.innerHTML = `<strong>Original recording subtitles</strong>
+      <button disabled data-format="srt">Download SRT</button>
+      <button disabled data-format="vtt">Download VTT</button>
+      <span role="status">Checking captions…</span>`;
+    parent.append(panel);
+    const status = panel.querySelector("span")!;
+    const buttons = Array.from(panel.querySelectorAll("button"));
+    let downloading = false;
+    async function refresh() {
+      if (!panel.isConnected) return;
+      try {
+        const response = await fetch("/api/subtitles", { cache: "no-store" });
+        const result = await response.json();
+        if (!downloading) {
+          const importing = (document.getElementById("uploadButton") as HTMLButtonElement | null)?.disabled;
+          status.textContent = importing ? "Subtitles unavailable while importing" : result.message || "Subtitles unavailable";
+          buttons.forEach(button => button.disabled = !!importing || !response.ok || !result.available);
+        }
+      } catch {
+        status.textContent = "Could not check subtitle availability";
+        buttons.forEach(button => button.disabled = true);
+      }
+      if (panel.isConnected) window.setTimeout(refresh, 2500);
+    }
+    buttons.forEach(button => button.addEventListener("click", async () => {
+      downloading = true;
+      buttons.forEach(button => button.disabled = true);
+      try {
+        const format = button.dataset.format!;
+        const response = await fetch(`/api/subtitles/${format}`, { cache: "no-store" });
+        if (!response.ok) {
+          const result = await response.json();
+          throw new Error(result.message || "Subtitle download failed");
+        }
+        const url = URL.createObjectURL(await response.blob());
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `original-recording.${format}`;
+        panel.append(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 60000);
+        status.textContent = "Subtitle download started";
+      } catch (error) {
+        status.textContent = error instanceof Error ? error.message : "Subtitle download failed";
+      } finally {
+        downloading = false;
+        // Recheck on the next availability poll before enabling downloads.
+      }
+    }));
+    void refresh();
+  }
+
   function injectStyles() {
+    if (document.getElementById("selectorStyles")) return;
     const style = document.createElement("style");
+    style.id = "selectorStyles";
     style.textContent = `
       * { box-sizing: border-box; margin: 0; padding: 0; }
       body { 
@@ -447,8 +560,14 @@ interface Segment {
     document.head.appendChild(style);
   }
   
-  function showUploadInterface() {
+  function showUploadInterface(errorMessage = "") {
     const app = document.getElementById("app")!;
+    const video = app.querySelector("video");
+    if (video) {
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+    }
     
     app.innerHTML = `
       <div class="upload-container">
@@ -465,23 +584,36 @@ interface Segment {
       </div>
     `;
   
+    mountSubtitles(app.querySelector(".upload-box")!);
     const videoInput = document.getElementById("videoInput") as HTMLInputElement;
     const uploadButton = document.getElementById("uploadButton") as HTMLButtonElement;
     const progressBar = document.getElementById("progressBar")!;
     const progressFill = document.getElementById("progressFill") as HTMLDivElement;
     const statusMessage = document.getElementById("statusMessage")!;
+    if (errorMessage) {
+      statusMessage.textContent = errorMessage;
+      statusMessage.style.color = "#ff6b6b";
+      statusMessage.setAttribute("role", "alert");
+      statusMessage.classList.add("visible");
+    }
   
     uploadButton.addEventListener("click", () => videoInput.click());
   
     videoInput.addEventListener("change", async (e) => {
       const file = (e.target as HTMLInputElement).files?.[0];
-      if (!file) return;
+      if (!file || uploadButton.disabled) return;
+      // Allow choosing the same file again after an upload or polling error.
+      videoInput.value = "";
   
       uploadButton.disabled = true;
+      app.querySelectorAll<HTMLButtonElement>("button[data-format]").forEach(button => button.disabled = true);
       uploadButton.textContent = "Uploading...";
       progressBar.classList.add("visible");
       statusMessage.classList.add("visible");
       statusMessage.textContent = "Uploading video...";
+      statusMessage.style.color = "";
+      statusMessage.removeAttribute("role");
+      progressFill.style.width = "0%";
   
       const formData = new FormData();
       formData.append("video", file);
@@ -494,12 +626,17 @@ interface Segment {
   
         const result = await response.json();
   
-        if (result.status === "ok") {
+        if (response.ok && result.status === "ok" && typeof result.task_id === "string" && result.task_id) {
           const taskId = result.task_id;
           statusMessage.textContent = "Processing video...";
           
-          const pollInterval = setInterval(async () => {
-            const statusResponse = await fetch(`/api/processing-status/${taskId}`);
+          // Sequential polling stays inside the upload error handler and stops
+          // when this screen is replaced. Bindings belong to its fresh nodes.
+          while (app.contains(uploadButton)) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            if (!app.contains(uploadButton)) return;
+            const statusResponse = await fetch(`/api/processing-status/${encodeURIComponent(taskId)}`);
+            if (!statusResponse.ok) throw new Error("Could not check video processing status.");
             const status = await statusResponse.json();
   
             if (status.progress) {
@@ -509,19 +646,16 @@ interface Segment {
             statusMessage.textContent = status.message || "Processing...";
   
             if (status.status === "complete") {
-              clearInterval(pollInterval);
               statusMessage.textContent = "Complete! Loading segments...";
               progressFill.style.width = "100%";
-              
-              setTimeout(() => location.reload(), 1000);
+              await main();
+              return;
             } else if (status.status === "error") {
-              clearInterval(pollInterval);
-              statusMessage.textContent = `Error: ${status.message}`;
-              statusMessage.style.color = "#ff6b6b";
-              uploadButton.disabled = false;
-              uploadButton.textContent = "Try Again";
+              throw new Error(status.message || "Video processing failed.");
+            } else if (status.status !== "processing") {
+              throw new Error("Invalid video processing status. Please try again.");
             }
-          }, 2000);
+          }
         } else {
           throw new Error(result.message);
         }
@@ -546,9 +680,7 @@ interface Segment {
             <button class="upload-new-btn" id="uploadNewBtn">📤 Upload New</button>
           </div>
           <div class="video-container">
-            <video id="mainVideo" controls>
-              <source src="/segments/${segments[0]?.filename || ''}" type="video/mp4">
-            </video>
+            <video id="mainVideo" controls></video>
           </div>
         </div>
         
@@ -583,12 +715,6 @@ interface Segment {
                 <input type="checkbox" id="rescoreCheck"> Re-run AI scoring (otherwise scores from the same instructions are reused)
               </label>
             </div>
-            <div style="margin-top: 12px; border-top: 1px solid #3a3d45; padding-top: 12px;">
-              <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px;">
-                <span id="llmStatus" style="font-size: 13px;">Checking AI backend...</span>
-                <button id="llmSettingsToggle" style="padding: 6px 12px; background: #2a2d35; border: 1px solid #3a3d45; color: #e0e0e0; border-radius: 6px; cursor: pointer; font-size: 12px; white-space: nowrap;">AI Settings</button>
-              </div>
-              <div id="llmNotice" style="font-size: 12px; opacity: 0.75; margin-top: 6px; line-height: 1.4;"></div>
               <div id="llmSettingsPanel" style="display: none; margin-top: 10px; padding: 12px; background: #23262e; border: 1px solid #3a3d45; border-radius: 6px;">
                 <div style="font-size: 12px; opacity: 0.7; margin-bottom: 10px;">
                   Scoring runs against a local model server if one is running (Ollama at
@@ -615,10 +741,9 @@ interface Segment {
                 </div>
                 <div id="llmTestResult" style="font-size: 12px; margin-top: 8px;"></div>
               </div>
-            </div>
             <div style="display: flex; gap: 10px; margin-top: 12px;">
-              <button id="previewBtn" style="flex: 1; padding: 10px; background: #2a2d35; border: 1px solid #3a3d45; color: #e0e0e0; border-radius: 6px; cursor: pointer; font-size: 13px;">Preview Selection</button>
-              <button id="resetSettingsBtn" style="padding: 10px 16px; background: #2a2d35; border: 1px solid #3a3d45; color: #e0e0e0; border-radius: 6px; cursor: pointer; font-size: 13px;">Default Settings</button>
+              <button id="previewBtn" style="flex: 1; padding: 10px; background: #2a2d35; border: 1px solid #3a3d45; color: #e0e0e0; border-radius: 6px; cursor: pointer; font-size: 13px;">Selection Statistics</button>
+              <button id="resetSettingsBtn" style="padding: 10px 16px; background: #2a2d35; border: 1px solid #3a3d45; color: #e0e0e0; border-radius: 6px; cursor: pointer; font-size: 13px;">Reset Threshold</button>
             </div>
             <div class="preview-info" id="previewInfo"></div>
             <div class="download-row" id="autoDownloadRow">
@@ -635,9 +760,16 @@ interface Segment {
           
           <div class="segments-list" id="segmentsList"></div>
           
-          <div style="padding: 16px 20px; border-top: 1px solid #2a2d35; background: #1e2129;">
+          <div id="generationControls" style="padding: 16px 20px; border-top: 1px solid #2a2d35; background: #1e2129;">
+            <div id="generationCriteria" style="font-size: 13px; margin-bottom: 6px;"></div>
+            <div id="generationThreshold" style="font-size: 13px; margin-bottom: 6px;"></div>
+            <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px;">
+              <span id="llmStatus" role="status" style="font-size: 13px;">Checking AI backend...</span>
+              <button id="llmSettingsToggle" style="padding: 6px 12px; background: #2a2d35; border: 1px solid #3a3d45; color: #e0e0e0; border-radius: 6px; cursor: pointer; font-size: 12px; white-space: nowrap;">AI Settings</button>
+            </div>
+            <div id="llmNotice" style="font-size: 12px; opacity: 0.75; margin: 6px 0 10px; line-height: 1.4;"></div>
             <div style="display: flex; gap: 10px;">
-              <button id="autoGenerateBtn" style="flex: 1; padding: 12px; background: #5b7cff; border: 1px solid #5b7cff; color: white; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500;">
+              <button id="autoGenerateBtn" disabled style="flex: 1; padding: 12px; background: #5b7cff; border: 1px solid #5b7cff; color: white; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500;">
                 ✨ Auto-Generate Highlight Reel
               </button>
               <button id="exportBtn" style="flex: 1; padding: 12px; background: #28a745; border: 1px solid #28a745; color: white; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; opacity: 0.3; cursor: not-allowed;" disabled>
@@ -657,6 +789,7 @@ interface Segment {
     const segmentsList = document.getElementById("segmentsList")!;
     const mainVideo = document.getElementById("mainVideo") as HTMLVideoElement;
     const exportBtn = document.getElementById("exportBtn") as HTMLButtonElement;
+    mountSubtitles(document.querySelector(".video-panel")!);
     const downloadLink = document.getElementById("downloadLink") as HTMLAnchorElement;
     const autoGenerateBtn = document.getElementById("autoGenerateBtn") as HTMLButtonElement;
     const autoDownloadLink = document.getElementById("autoDownloadLink") as HTMLAnchorElement;
@@ -667,6 +800,9 @@ interface Segment {
     const previewBtn = document.getElementById("previewBtn") as HTMLButtonElement;
     const previewInfo = document.getElementById("previewInfo")!;
     const minScoreSlider = document.getElementById("minScoreSlider") as HTMLInputElement;
+    const instructionsInput = document.getElementById("aiInstructions") as HTMLTextAreaElement;
+    const generationCriteria = document.getElementById("generationCriteria")!;
+    const generationThreshold = document.getElementById("generationThreshold")!;
     const scoreValue = document.getElementById("scoreValue")!;
     const resetSettingsBtn = document.getElementById("resetSettingsBtn") as HTMLButtonElement;
     const selectedCountEl = document.getElementById("selectedCount")!;
@@ -689,16 +825,34 @@ interface Segment {
     const selectedIds = new Set<number>();
     let currentSegmentId: number | null = segments.length > 0 ? segments[0].id : null;
     let llmAvailable = false;
+    let autoGenerating = false;
+    let exporting = false;
+
+    // Native controls own the current values even while Advanced is hidden.
+    // Both request paths take the same snapshot; panel visibility is only UI state.
+    function readScoringSelection() {
+      return { min_score: Number(minScoreSlider.value), instructions: instructionsInput.value.trim() };
+    }
+
+    function updateScoringSummary() {
+      const selection = readScoringSelection();
+      scoreValue.textContent = String(selection.min_score);
+      generationCriteria.textContent = selection.instructions
+        ? `Criteria: ${selection.instructions}` : "Criteria: required — describe highlights in Advanced.";
+      generationThreshold.textContent = `Score threshold: ${selection.min_score}+`;
+      previewInfo.classList.remove("visible");
+    }
 
     function setAutoGenerateEnabled(enabled: boolean) {
-      autoGenerateBtn.disabled = !enabled;
-      autoGenerateBtn.style.opacity = enabled ? "1" : "0.5";
-      autoGenerateBtn.style.cursor = enabled ? "pointer" : "not-allowed";
+      autoGenerateBtn.disabled = !enabled || autoGenerating;
+      autoGenerateBtn.style.opacity = autoGenerateBtn.disabled ? "0.5" : "1";
+      autoGenerateBtn.style.cursor = autoGenerateBtn.disabled ? "not-allowed" : "pointer";
     }
 
     async function refreshLlmStatus() {
       try {
         const response = await fetch("/api/llm-settings");
+        if (!response.ok) throw new Error("Could not check AI backend status.");
         const s = await response.json();
         llmBaseUrl.value = s.base_url || "";
         llmModel.value = s.model || "";
@@ -725,7 +879,10 @@ interface Segment {
           llmNotice.textContent = "Auto-Generate is disabled. Run a local model server (e.g. Ollama) or add an API key under AI Settings. Manual clip selection always works, fully offline.";
         }
       } catch {
+        llmAvailable = false;
+        setAutoGenerateEnabled(false);
         llmStatus.textContent = "AI backend: status unavailable";
+        llmNotice.textContent = "Auto-Generate is disabled. Check the backend connection, then save or test your AI Settings to retry.";
       }
     }
 
@@ -785,30 +942,42 @@ interface Segment {
           body: JSON.stringify({})
         });
         const result = await response.json();
-        if (result.status === "ok") {
+        if (response.ok && result.status === "ok") {
           llmTestResult.textContent = `Connected: ${result.backend} backend, model ${result.model}.`;
           llmTestResult.style.color = "#7ee08a";
+          await refreshLlmStatus();
         } else {
           llmTestResult.textContent = `Failed: ${result.message}`;
           llmTestResult.style.color = "#ff8a8a";
+          llmAvailable = false;
+          setAutoGenerateEnabled(false);
+          llmStatus.textContent = "AI scoring: connection failed";
+          llmNotice.textContent = `${result.message} Check AI Settings and test the connection again.`;
         }
       } catch (err) {
         console.error(err);
         llmTestResult.textContent = "Failed: could not reach the backend server.";
         llmTestResult.style.color = "#ff8a8a";
+        llmAvailable = false;
+        setAutoGenerateEnabled(false);
+        llmStatus.textContent = "AI scoring: connection failed";
+        llmNotice.textContent = "Could not reach the backend server. Check the backend connection and test AI Settings again.";
       } finally {
         llmTestBtn.disabled = false;
         llmTestBtn.textContent = "Test Connection";
       }
     });
 
+    updateScoringSummary();
+    setAutoGenerateEnabled(false);
     refreshLlmStatus();
   
     if (segments.length > 0) {
-      mainVideo.src = `/segments/${segments[0].filename}`;
+      mainVideo.src = `/segments/${encodeURIComponent(segments[0].filename)}`;
     }
   
     uploadNewBtn.addEventListener("click", () => {
+      if (autoGenerating || exporting) return;
       if (confirm("Upload a new video? Current progress will be lost.")) {
         // Clear the current view and show upload interface
         showUploadInterface();
@@ -819,7 +988,7 @@ interface Segment {
       const segment = segments.find(s => s.id === segmentId);
       if (segment) {
         currentSegmentId = segmentId;
-        mainVideo.src = `/segments/${segment.filename}`;
+        mainVideo.src = `/segments/${encodeURIComponent(segment.filename)}`;
         mainVideo.currentTime = 0;
       }
     }
@@ -837,8 +1006,8 @@ interface Segment {
         .reduce((a, s) => a + s.duration, 0);
       selectedDurationEl.textContent = totalDur.toFixed(1) + "s";
       
-      exportBtn.disabled = selectedIds.size === 0;
-      if (selectedIds.size === 0) {
+      exportBtn.disabled = selectedIds.size === 0 || exporting;
+      if (exportBtn.disabled) {
         exportBtn.style.opacity = "0.3";
         exportBtn.style.cursor = "not-allowed";
       } else {
@@ -862,7 +1031,7 @@ interface Segment {
           <div class="segment-id">${seg.id}</div>
           <div class="segment-time">${formatTime(seg.start)}</div>
           <div class="segment-time">${formatTime(seg.end)}</div>
-          <div class="segment-text">${seg.text}</div>
+          <div class="segment-text"></div>
           <div class="segment-info">
             ${seg.is_keyword ? '<span class="segment-score">CPS: High</span>' : ''}
             <span>Duration: ${seg.duration.toFixed(1)}s</span>
@@ -872,6 +1041,7 @@ interface Segment {
             <button class="icon-btn play-btn" data-id="${seg.id}" title="Play segment">▶</button>
           </div>
         `;
+        div.querySelector(".segment-text")!.textContent = seg.text;
         
         const checkbox = div.querySelector(".segment-checkbox") as HTMLInputElement;
         checkbox.addEventListener("change", (e) => {
@@ -896,9 +1066,6 @@ interface Segment {
             updateVideoForSegment(seg.id);
             document.querySelectorAll('.segment-row').forEach(row => row.classList.remove('active'));
             div.classList.add('active');
-            
-            checkbox.checked = !checkbox.checked;
-            checkbox.dispatchEvent(new Event("change"));
           }
         });
   
@@ -907,6 +1074,7 @@ interface Segment {
     }
   
     renderSegments();
+    updateStats();
   
     document.getElementById("selectAll")!.addEventListener("click", () => {
       segments.forEach(s => selectedIds.add(s.id));
@@ -935,19 +1103,17 @@ interface Segment {
       advancedSection.classList.toggle("visible");
     });
   
-    minScoreSlider.addEventListener("input", () => {
-      scoreValue.textContent = minScoreSlider.value;
-      previewInfo.classList.remove("visible");
-    });
+    minScoreSlider.addEventListener("input", updateScoringSummary);
+    instructionsInput.addEventListener("input", updateScoringSummary);
   
     resetSettingsBtn.addEventListener("click", () => {
       minScoreSlider.value = "7";
-      scoreValue.textContent = "7";
-      previewInfo.classList.remove("visible");
+      updateScoringSummary();
     });
   
     previewBtn.addEventListener("click", async () => {
-      const minScore = parseInt(minScoreSlider.value);
+      if (previewBtn.disabled) return;
+      const selection = readScoringSelection();
       previewBtn.disabled = true;
       previewBtn.style.opacity = "0.5";
       previewBtn.textContent = "Loading...";
@@ -956,74 +1122,80 @@ interface Segment {
         const response = await fetch("/api/preview-auto-export", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ min_score: minScore })
+          body: JSON.stringify(selection)
         });
         const result = await response.json();
         
-        if (result.status === "ok") {
+        const current = readScoringSelection();
+        if (current.min_score !== selection.min_score || current.instructions !== selection.instructions) return;
+
+        if (response.ok && result.status === "ok") {
           const duration = Math.round(result.estimated_duration_seconds);
-          previewInfo.innerHTML = `
-            📊 ${result.count} highlights (of ${result.total_available} available)<br>
-            ⏱️ Duration: ${duration}s (${Math.floor(duration/60)}:${(duration%60).toString().padStart(2,'0')})<br>
-            🎯 Threshold: ${minScore}+
-          `;
+          previewInfo.replaceChildren(
+            document.createTextNode(`📊 Selection Statistics: ${result.count} highlights (of ${result.total_available} available)`),
+            document.createElement("br"),
+            document.createTextNode(`⏱️ Duration: ${duration}s (${Math.floor(duration/60)}:${(duration%60).toString().padStart(2,'0')})`),
+            document.createElement("br"),
+            document.createTextNode(`🎯 Threshold: ${selection.min_score}+`)
+          );
           previewInfo.classList.add("visible");
         } else {
+          previewInfo.classList.remove("visible");
           alert(`Error: ${result.message}`);
         }
       } catch (err) {
         console.error(err);
-        alert("Failed to load preview");
+        previewInfo.classList.remove("visible");
+        alert("Failed to load selection statistics");
       } finally {
         previewBtn.disabled = false;
         previewBtn.style.opacity = "1";
-        previewBtn.textContent = "Preview Selection";
+        previewBtn.textContent = "Selection Statistics";
       }
     });
   
     autoGenerateBtn.addEventListener("click", async () => {
+      if (autoGenerating) return;
       if (!llmAvailable) {
         advancedSection.classList.add("visible");
-        alert("No AI backend is configured. Run a local model server (e.g. Ollama) or add an API key under AI Settings.");
+        alert(llmNotice.textContent || "Check AI Settings before auto-generating.");
         return;
       }
-      const useScoreFilter = advancedSection.classList.contains("visible");
-      const minScore = useScoreFilter ? parseInt(minScoreSlider.value) : 0;
-      const instructionsInput = document.getElementById("aiInstructions") as HTMLTextAreaElement;
-      const instructions = instructionsInput.value.trim();
+      const selection = readScoringSelection();
       const rescore = (document.getElementById("rescoreCheck") as HTMLInputElement).checked;
 
-      if (!instructions) {
+      if (!selection.instructions) {
         advancedSection.classList.add("visible");
         alert("Please describe what counts as a highlight before auto-generating.");
         instructionsInput.focus();
         return;
       }
 
+      autoGenerating = true;
+      uploadNewBtn.disabled = true;
       autoGenerateBtn.disabled = true;
       autoGenerateBtn.style.opacity = "0.5";
       autoGenerateBtn.style.cursor = "not-allowed";
       autoGenerateBtn.textContent = "Starting...";
-      autoDownloadRow.classList.remove("visible");
 
       try {
         const response = await fetch("/api/auto-generate", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            min_score: minScore,
+            ...selection,
             sort_chronological: true,
-            instructions: instructions,
             rescore: rescore
           })
         });
         const result = await response.json();
 
-        if (result.status !== "ok" || !result.task_id) {
+        if (!response.ok || result.status !== "ok" || !result.task_id) {
           alert(`Error: ${result.message || "Failed to start auto-generation"}`);
           return;
         }
 
+        autoDownloadRow.classList.remove("visible");
         // Poll the task: AI scoring can take a minute or two
         const deadline = Date.now() + 15 * 60 * 1000;
         while (Date.now() < deadline) {
@@ -1037,7 +1209,7 @@ interface Segment {
             autoDownloadRow.classList.add("visible");
             autoDownloadLink.textContent = `✅ Download (${status.highlights_used} clips, ${status.file_size_mb} MB)`;
 
-            const filterMsg = useScoreFilter ? ` (score >= ${minScore})` : "";
+            const filterMsg = ` (score >= ${selection.min_score})`;
             alert(`Ready! ${status.highlights_used} of ${status.total_available} highlights${filterMsg}.`);
             return;
           }
@@ -1052,33 +1224,46 @@ interface Segment {
         console.error(err);
         alert("Failed to auto-generate highlight reel");
       } finally {
+        autoGenerating = false;
+        uploadNewBtn.disabled = exporting;
         setAutoGenerateEnabled(llmAvailable);
         autoGenerateBtn.textContent = "✨ Auto-Generate Highlight Reel";
       }
     });
   
     discardAutoBtn.addEventListener("click", async () => {
+      if (discardAutoBtn.disabled) return;
       if (!confirm("Discard this auto-generated reel? You can then try a new prompt or pick clips manually.")) return;
 
       const href = autoDownloadLink.getAttribute("href");
-      autoDownloadRow.classList.remove("visible");
-      autoDownloadLink.removeAttribute("href");
-
-      if (href) {
-        // Best-effort server-side cleanup; the UI is already reset.
-        try {
-          await fetch("/api/discard-reel", {
+      discardAutoBtn.disabled = true;
+      try {
+        if (href) {
+          const response = await fetch("/api/discard-reel", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ output_file: href })
           });
-        } catch (err) {
-          console.error("Failed to delete reel on server:", err);
+          const result = await response.json();
+          if (!response.ok || result.status !== "ok") {
+            alert(`Error: ${result.message || "Failed to discard reel"}`);
+            return;
+          }
         }
+        autoDownloadRow.classList.remove("visible");
+        autoDownloadLink.removeAttribute("href");
+      } catch (err) {
+        console.error("Failed to delete reel on server:", err);
+        alert("Failed to discard reel");
+      } finally {
+        discardAutoBtn.disabled = false;
       }
     });
 
     exportBtn.addEventListener("click", async () => {
+      if (exporting || selectedIds.size === 0) return;
+      exporting = true;
+      uploadNewBtn.disabled = true;
       const payload = { selected_ids: Array.from(selectedIds) };
       exportBtn.disabled = true;
       exportBtn.style.opacity = "0.5";
@@ -1103,9 +1288,9 @@ interface Segment {
         console.error(err);
         alert("Failed to send selected segments");
       } finally {
-        exportBtn.disabled = false;
-        exportBtn.style.opacity = "1";
-        exportBtn.style.cursor = "pointer";
+        exporting = false;
+        uploadNewBtn.disabled = autoGenerating;
+        updateStats();
         exportBtn.textContent = "Create Highlight Reel";
       }
     });
