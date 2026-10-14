@@ -11,12 +11,13 @@ import tempfile
 import threading
 from uuid import uuid4
 from datetime import datetime
-from flask import Flask, request, jsonify, send_from_directory, Response
+from flask import Flask, request, jsonify, send_file, send_from_directory, Response
 from flask_cors import CORS
 from moviepy import VideoFileClip, concatenate_videoclips
 from werkzeug.utils import secure_filename
 from subtitle_serializer import serialize_subtitles, NoCaptions
 from transcript_store import invalidate_transcript, read_current_transcript
+from source_preview import SOURCE_LOCK, UNAVAILABLE as SOURCE_UNAVAILABLE, invalidate_source, publish_source, resolve_source
 
 # Safe to import at module level: scoring.py only touches heavy/optional
 # deps (requests session, g4f) lazily inside the backends.
@@ -174,9 +175,34 @@ def get_segments_json():
         # Return empty segments list so the app shows the styled upload screen
         return jsonify({"segments": []}), 200
     
-    directory = os.path.dirname(SEGMENTS_JSON)
-    filename = os.path.basename(SEGMENTS_JSON)
-    return send_from_directory(directory, filename)
+    with SOURCE_LOCK:
+        try:
+            _, source = resolve_source(MANIFEST_DIR, UPLOAD_FOLDER)
+        except ValueError:
+            # Preserve the existing serving/validation contract for legacy or
+            # malformed manifests. The UI handles a missing source explicitly.
+            response = send_from_directory(os.path.dirname(SEGMENTS_JSON), os.path.basename(SEGMENTS_JSON))
+        else:
+            with open(SEGMENTS_JSON, encoding='utf-8') as stream:
+                manifest = json.load(stream)
+            manifest['source'] = source
+            response = jsonify(manifest)
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+
+
+@app.route('/api/source/<source_id>')
+def serve_source(source_id):
+    # Opening the validated, uniquely named upload happens under the same lock
+    # as replacement invalidation. Flask handles conditional HTTP byte ranges.
+    with SOURCE_LOCK:
+        try:
+            path, _ = resolve_source(MANIFEST_DIR, UPLOAD_FOLDER, source_id)
+        except ValueError:
+            return jsonify(status='error', message=SOURCE_UNAVAILABLE), 404
+        response = send_file(path, conditional=True)
+        response.headers['Cache-Control'] = 'no-store'
+        return response
 
 # Serve individual video segments
 @app.route("/segments/<filename>")
@@ -382,9 +408,9 @@ def process_video_async(video_path, output_folder, task_id):
                             segment_count = len(manifest.get("segments", []))
                             
                             processing_status[task_id] = {
-                                "status": "complete",
-                                "progress": 100,
-                                "message": "Processing complete!",
+                                "status": "processing",
+                                "progress": 99,
+                                "message": "Finalizing recording…",
                                 "segment_count": segment_count,
                                 "output_folder": output_folder
                             }
@@ -452,6 +478,13 @@ def process_video_async(video_path, output_folder, task_id):
                 segment_count = len(manifest.get("segments", []))
                 
                 print(f"DEBUG: Manifest found with {segment_count} segments")
+                # Source preview is optional: failed validation must never
+                # turn a successful legacy import/export into a failed job.
+                with SOURCE_LOCK:
+                    try:
+                        publish_source(output_folder, UPLOAD_FOLDER, video_path, task_id.removeprefix('task_'))
+                    except (OSError, ValueError) as error:
+                        app.logger.warning('Source preview unavailable: %s', error)
                 
                 if processing_status[task_id].get("status") != "complete":
                     processing_status[task_id] = {
@@ -562,7 +595,9 @@ def upload_video():
             return workspace_busy()
 
         # Fail closed before any replacement work, including upload/worker failures.
-        invalidate_transcript(MANIFEST_DIR)
+        with SOURCE_LOCK:
+            invalidate_source(MANIFEST_DIR)
+            invalidate_transcript(MANIFEST_DIR)
 
         # Ensure upload folder exists with proper permissions
         upload_path = os.path.abspath(UPLOAD_FOLDER)
@@ -584,8 +619,8 @@ def upload_video():
         
         # Save uploaded file
         filename = secure_filename(file.filename)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_filename = f"{timestamp}_{filename}"
+        task_id = f"task_{uuid4().hex}"
+        unique_filename = f"{task_id.removeprefix('task_')}_{filename}"
         video_path = os.path.join(upload_path, unique_filename)
         
         # Ensure we're using absolute path
@@ -655,9 +690,6 @@ def upload_video():
                 "status": "error",
                 "message": f"Failed to create output directory: {str(e)}"
             }), 500
-        
-        # Generate task ID
-        task_id = f"task_{uuid4().hex}"
         
         # Register task immediately so status endpoint can find it
         processing_status[task_id] = {

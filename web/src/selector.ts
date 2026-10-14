@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+import "./selector.css";
+import { formatSourceTime as formatTime, readSource, setupSourceTimeline, timelineMarkup, type SourceReference } from './source-timeline';
+
+const logoUrl = new URL("./assets/Hi-Lite-Logo.png", import.meta.url).href;
+
 interface Segment {
     id: number;
     start: number;
@@ -58,13 +63,278 @@ interface Segment {
     }));
   }
 
-  async function main() {
-    injectStyles();
+  let disposeShell = () => {};
+
+  function shellMarkup(workspace: string, review = false) {
+    return `<div class="editor-shell ${review ? 'review-shell main-container' : 'import-shell'}">
+      ${review ? '<a class="skip-link" href="#transcriptHeading">Skip to transcript</a>' : ''}
+      <header class="shell-header">
+        <h1 class="shell-brand"><img class="brand-logo" src="${logoUrl}" alt="" width="32" height="32">Hi-Lite</h1>
+        <span class="recording-context" id="recordingContext">${review ? 'Current recording' : 'Import a recording'}</span>
+        ${review ? `<div class="header-actions">
+          <button class="drawer-trigger" id="mediaTrigger" aria-controls="mediaPanel" aria-expanded="false">Media</button>
+          <button class="drawer-trigger" id="contextTrigger" aria-controls="contextPanel" aria-expanded="false">AI Highlights
+            <span id="contextProviderSummary">Checking AI backend…</span></button>
+          <span class="header-selection" id="headerSelectedCount">0 selected</span>
+          <button id="exportBtn" disabled>Create Reel from Selected Clips</button>
+        </div>` : ''}
+      </header>
+      <div class="workspace ${review ? '' : 'import-workspace upload-container'}">${workspace}</div>
+      ${review ? timelineMarkup : ''}
+      <footer class="activity-footer" aria-label="Activity">
+        <div class="activity-summary"><strong>Activity</strong>
+          <span id="statusMessage" role="status">${review ? 'Ready to review' : 'Choose a video file to begin'}</span>
+          <button id="activityToggle" aria-expanded="false" aria-controls="activityDetails" hidden>Details</button></div>
+        <div class="progress-bar" id="progressBar" role="progressbar" aria-label="Operation progress" hidden><div class="progress-fill" id="progressFill"></div></div>
+        <div id="activityErrorSummary" hidden></div>
+        <div id="activityDetails" hidden>
+          <div id="activityErrors"></div>
+          <div class="activity-results" id="activityResults">
+            ${review ? `<a id="downloadLink" class="download-link">Download Reel from Selected Clips</a>
+              <div class="download-row" id="autoDownloadRow">
+                <a id="autoDownloadLink" class="download-link">Download Auto-Generated Reel</a>
+                <button id="discardAutoBtn" class="discard-btn">Discard</button>
+              </div>` : ''}
+          </div>
+        </div>
+      </footer>
+    </div>`;
+  }
+
+  function setupActivity() {
+    const status = document.getElementById("statusMessage")!;
+    const bar = document.getElementById("progressBar")!;
+    const fill = document.getElementById("progressFill")!;
+    const errors = document.getElementById("activityErrors")!;
+    const summary = document.getElementById("activityErrorSummary")!;
+    const details = document.getElementById("activityDetails")!;
+    const toggle = document.getElementById("activityToggle")!;
+    function expand(open: boolean) {
+      if (!open && details.contains(document.activeElement)) toggle.focus();
+      details.hidden = !open;
+      toggle.setAttribute("aria-expanded", String(open));
+      updateErrorSummary();
+    }
+    function updateErrorSummary() {
+      summary.hidden = errors.children.length === 0;
+      summary.textContent = `${errors.children.length} request error${errors.children.length === 1 ? '' : 's'}${details.hidden ? ' — open Details for recovery' : ''}`;
+    }
+    toggle.addEventListener("click", () => expand(details.hidden));
+    function clearError(operation: string) {
+      Array.from(errors.children).forEach(node => {
+        if ((node as HTMLElement).dataset.operation === operation) {
+          if (node.contains(document.activeElement)) toggle.focus();
+          node.remove();
+        }
+      });
+      updateErrorSummary();
+    }
+    return {
+      status(operation: string, message: string, progress?: number) {
+        status.dataset.operation = operation;
+        // Progress ticks update the bar, not a second live announcement.
+        const text = `${operation}: ${message}`;
+        if (status.textContent !== text) status.textContent = text;
+        bar.hidden = false;
+        bar.classList.add("visible");
+        const known = typeof progress === "number" && Number.isFinite(progress);
+        bar.classList.toggle("indeterminate", !known);
+        if (known) {
+          const value = Math.max(0, Math.min(100, progress));
+          fill.style.width = `${value}%`;
+          bar.setAttribute("aria-valuenow", String(value));
+        } else {
+          fill.style.width = "";
+          bar.removeAttribute("aria-valuenow");
+        }
+      },
+      finish(operation: string, message: string) {
+        if (status.dataset.operation !== operation) return;
+        status.textContent = `${operation}: ${message}`;
+        delete status.dataset.operation;
+        bar.hidden = true;
+        bar.classList.remove("visible");
+      },
+      error(operation: string, message: string, recovery: string) {
+        clearError(operation);
+        const row = document.createElement("div");
+        row.className = "activity-error";
+        row.dataset.operation = operation;
+        const text = document.createElement("span");
+        text.setAttribute("role", "alert");
+        text.textContent = `${operation}: ${message} ${recovery}`;
+        const dismiss = document.createElement("button");
+        dismiss.textContent = "Dismiss";
+        dismiss.setAttribute("aria-label", `Dismiss ${operation} error`);
+        dismiss.inert = !!document.querySelector<HTMLElement>(".editor-shell")?.dataset.drawer;
+        dismiss.addEventListener("click", () => clearError(operation));
+        row.append(text, dismiss);
+        errors.append(row);
+        toggle.hidden = false;
+        expand(true);
+      },
+      clearError,
+      results() { toggle.hidden = false; expand(true); }
+    };
+  }
+
+  function setupShell() {
+    disposeShell();
+    const controller = new AbortController();
+    disposeShell = () => controller.abort();
+    const activity = setupActivity();
+    const root = document.querySelector<HTMLElement>(".editor-shell")!;
+    const mediaNode = document.getElementById("mediaPanel");
+    const contextNode = document.getElementById("contextPanel");
+    if (!mediaNode || !contextNode) return { activity, openContext() {} };
+    const media = mediaNode;
+    const context = contextNode;
+
+    const mediaTrigger = document.getElementById("mediaTrigger")!;
+    const contextTrigger = document.getElementById("contextTrigger")!;
+    const header = root.querySelector<HTMLElement>(".shell-header")!;
+    const editor = document.getElementById("centralEditor")!;
+    const results = document.getElementById("activityResults")!;
+    const activityToggle = document.getElementById("activityToggle")!;
+    const skip = root.querySelector<HTMLElement>(".skip-link")!;
+    const backdrop = document.getElementById("drawerBackdrop")!;
+    let openPane: HTMLElement | null = null;
+    let opener: HTMLElement | null = null;
+    let lastFocused = document.activeElement as HTMLElement;
+    const isDrawer = (pane: HTMLElement) =>
+      pane === media || window.innerWidth < 1600 || root.dataset.contextHidden === "true";
+    const triggerFor = (pane: HTMLElement) => pane === media ? mediaTrigger : contextTrigger;
+    const headingFor = (pane: HTMLElement) => pane.querySelector<HTMLElement>("h2")!;
+    function focusTargets(pane: HTMLElement) {
+      return Array.from(pane.querySelectorAll<HTMLElement>('button, input, textarea, a[href], [tabindex="0"]'))
+        .filter(node => node.checkVisibility() && !(node as HTMLButtonElement).disabled);
+    }
+    function setModality(pane: HTMLElement | null) {
+      root.dataset.drawer = pane?.id || "";
+      editor.inert = !!pane;
+      document.getElementById('sourceTimeline')!.inert = !!pane;
+      header.inert = !!pane;
+      skip.inert = !!pane;
+      results.inert = !!pane;
+      activityToggle.inert = !!pane;
+      document.querySelectorAll<HTMLElement>("#activityErrors button").forEach(button => button.inert = !!pane);
+      media.inert = !!pane && pane !== media;
+      context.inert = !!pane && pane !== context;
+      backdrop.style.display = pane ? "block" : "";
+    }
+    function closeDrawer(restore = true) {
+      if (!openPane) return;
+      const pane = openPane;
+      const target = opener;
+      openPane = null;
+      opener = null;
+      pane.classList.remove("drawer-open");
+      pane.removeAttribute("role");
+      pane.removeAttribute("aria-modal");
+      triggerFor(pane).setAttribute("aria-expanded", "false");
+      setModality(null);
+      if (restore) (target?.checkVisibility() ? target : headingFor(pane)).focus();
+    }
+    function openDrawer(pane: HTMLElement, trigger = triggerFor(pane), keepFocus = false) {
+      if (!isDrawer(pane)) return;
+      if (openPane === pane) return;
+      closeDrawer(false);
+      openPane = pane;
+      opener = trigger;
+      pane.classList.add("drawer-open");
+      pane.setAttribute("role", "dialog");
+      pane.setAttribute("aria-modal", "true");
+      triggerFor(pane).setAttribute("aria-expanded", "true");
+      setModality(pane);
+      if (!keepFocus) headingFor(pane).focus();
+    }
+    mediaTrigger.addEventListener("click", () => openDrawer(media));
+    contextTrigger.addEventListener("click", () => {
+      if (window.innerWidth >= 1600) {
+        root.dataset.contextHidden = "false";
+        responsive();
+        headingFor(context).focus();
+      } else openDrawer(context);
+    });
+    [media, context].forEach(pane => pane.querySelector(".drawer-close")!.addEventListener("click", () => {
+      if (pane === context && !isDrawer(context)) {
+        root.dataset.contextHidden = "true";
+        contextTrigger.setAttribute("aria-expanded", "false");
+        contextTrigger.focus();
+      } else closeDrawer();
+    }));
+    backdrop.addEventListener("click", () => closeDrawer());
+    // A running action can disable the focused button and move focus to body.
+    // Drawer Escape/Tab must still work until that drawer has closed.
+    document.addEventListener("keydown", event => {
+      if (!openPane) return;
+      if (event.key === "Escape") { event.preventDefault(); closeDrawer(); }
+      if (event.key === "Tab") {
+        const targets = focusTargets(openPane);
+        const index = targets.indexOf(document.activeElement as HTMLElement);
+        if (!targets.length) { event.preventDefault(); headingFor(openPane).focus(); }
+        else if (event.shiftKey && index <= 0) { event.preventDefault(); targets[targets.length - 1].focus(); }
+        else if (!event.shiftKey && (index === targets.length - 1 || index < 0)) { event.preventDefault(); targets[0].focus(); }
+      }
+    }, { signal: controller.signal });
+    root.addEventListener("focusin", event => {
+      lastFocused = event.target as HTMLElement;
+      if (openPane && !openPane.contains(event.target as Node)) headingFor(openPane).focus();
+    });
+    function updateChromeHeight() {
+      const footerHeight = root.querySelector<HTMLElement>("footer")!.offsetHeight;
+      root.style.setProperty("--shell-header-height", `${header.offsetHeight}px`);
+      root.style.setProperty("--shell-footer-height", `${footerHeight}px`);
+      root.style.setProperty("--shell-chrome-height", `${header.offsetHeight + footerHeight}px`);
+    }
+    function responsive() {
+      // Chromium may blur a control as the breakpoint hides its old layout.
+      const focused = document.activeElement === document.body && !lastFocused.checkVisibility()
+        ? lastFocused : document.activeElement as HTMLElement;
+      updateChromeHeight();
+      if (openPane && !isDrawer(openPane)) {
+        const pane = openPane;
+        closeDrawer(false);
+        if (focused === triggerFor(pane) || !focused.checkVisibility()) headingFor(pane).focus();
+      }
+      for (const pane of [media, context]) {
+        if (pane.contains(focused) && isDrawer(pane) && openPane !== pane) {
+          openDrawer(pane, triggerFor(pane), true);
+          focused.focus({ preventScroll: true });
+        }
+        if (focused === triggerFor(pane) && !isDrawer(pane)) headingFor(pane).focus();
+      }
+      const docked = !isDrawer(context);
+      contextTrigger.setAttribute("aria-expanded", String(docked || openPane === context));
+      const closeButton = context.querySelector(".drawer-close")!;
+      closeButton.textContent = docked ? "Hide" : "Close";
+      closeButton.setAttribute("aria-label", `${docked ? 'Hide' : 'Close'} AI Highlights`);
+    }
+    window.addEventListener("resize", responsive, { signal: controller.signal });
+    const chromeObserver = new ResizeObserver(updateChromeHeight);
+    chromeObserver.observe(header);
+    chromeObserver.observe(root.querySelector("footer")!);
+    disposeShell = () => { controller.abort(); chromeObserver.disconnect(); };
+    responsive();
+    return { activity, openContext() {
+      if (window.innerWidth >= 1600) {
+        root.dataset.contextHidden = "false";
+        responsive();
+      } else openDrawer(context);
+    } };
+  }
+
+  async function main(recordingName?: string) {
     const app = document.getElementById("app")!;
-    app.innerHTML = "<h1>Loading...</h1>";
+    if (!app.querySelector(".editor-shell")) {
+      app.innerHTML = shellMarkup('<main class="upload-box"><h2>Loading recording…</h2></main>');
+      app.querySelector(".workspace")!.classList.remove("upload-container");
+      setupShell().activity.status("Recording", "Loading…");
+    }
   
     // Try to load segments
     let segments: Segment[];
+    let source: SourceReference | null = null;
     let currentVideoId = "default";
   
     try {
@@ -74,7 +344,9 @@ interface Segment {
         return;
       }
       if (!response.ok) throw new Error(`Could not load the recording manifest (HTTP ${response.status}).`);
-      segments = readSegments(await response.json());
+      const manifest = await response.json();
+      segments = readSegments(manifest);
+      source = readSource(manifest);
     } catch (err) {
       const message = err instanceof Error && !(err instanceof SyntaxError)
         ? err.message : "The recording manifest could not be read. It may contain invalid JSON.";
@@ -82,19 +354,21 @@ interface Segment {
       return;
     }
 
-    if (segments.length === 0) {
+    if (segments.length === 0 && !source) {
       showUploadInterface();
       return;
     }
     
     // Build main UI
-    buildMainUI(segments, currentVideoId);
+    buildMainUI(segments, currentVideoId, recordingName, source);
   }
   
-  function mountSubtitles(parent: HTMLElement) {
+  function mountSubtitles(parent: HTMLElement, activity: ReturnType<typeof setupActivity>) {
     const panel = document.createElement("section");
-    panel.style.cssText = "padding:16px;display:flex;gap:12px;flex-wrap:wrap;align-items:center";
+    panel.className = "subtitles-panel";
+    panel.setAttribute("aria-label", "Original recording subtitles");
     panel.innerHTML = `<strong>Original recording subtitles</strong>
+      <p>Full original transcript on recording time, including unselected speech.</p>
       <button disabled data-format="srt">Download SRT</button>
       <button disabled data-format="vtt">Download VTT</button>
       <span role="status">Checking captions…</span>`;
@@ -102,6 +376,9 @@ interface Segment {
     const status = panel.querySelector("span")!;
     const buttons = Array.from(panel.querySelectorAll("button"));
     let downloading = false;
+    function setStatus(message: string) {
+      if (status.textContent !== message) status.textContent = message;
+    }
     async function refresh() {
       if (!panel.isConnected) return;
       try {
@@ -109,11 +386,11 @@ interface Segment {
         const result = await response.json();
         if (!downloading) {
           const importing = (document.getElementById("uploadButton") as HTMLButtonElement | null)?.disabled;
-          status.textContent = importing ? "Subtitles unavailable while importing" : result.message || "Subtitles unavailable";
+          setStatus(importing ? "Subtitles unavailable while importing" : result.message || "Subtitles unavailable");
           buttons.forEach(button => button.disabled = !!importing || !response.ok || !result.available);
         }
       } catch {
-        status.textContent = "Could not check subtitle availability";
+        setStatus("Could not check subtitle availability");
         buttons.forEach(button => button.disabled = true);
       }
       if (panel.isConnected) window.setTimeout(refresh, 2500);
@@ -136,9 +413,12 @@ interface Segment {
         link.click();
         link.remove();
         window.setTimeout(() => URL.revokeObjectURL(url), 60000);
-        status.textContent = "Subtitle download started";
+        setStatus("Subtitle download started");
+        activity.clearError("Subtitle download");
       } catch (error) {
-        status.textContent = error instanceof Error ? error.message : "Subtitle download failed";
+        const message = error instanceof Error ? error.message : "Subtitle download failed";
+        setStatus(message);
+        activity.error("Subtitle download", message, "Retry SRT or VTT in Media when available.");
       } finally {
         downloading = false;
         // Recheck on the next availability poll before enabling downloads.
@@ -147,420 +427,8 @@ interface Segment {
     void refresh();
   }
 
-  function injectStyles() {
-    if (document.getElementById("selectorStyles")) return;
-    const style = document.createElement("style");
-    style.id = "selectorStyles";
-    style.textContent = `
-      * { box-sizing: border-box; margin: 0; padding: 0; }
-      body { 
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-        background: #1a1d24;
-        color: #e0e0e0;
-        overflow: hidden;
-      }
-      .main-container {
-        display: flex;
-        height: 100vh;
-        background: #1a1d24;
-      }
-      
-      .video-panel {
-        flex: 0 0 40%;
-        display: flex;
-        flex-direction: column;
-        background: #0d0f14;
-        border-right: 1px solid #2a2d35;
-      }
-      .video-header {
-        padding: 16px 20px;
-        border-bottom: 1px solid #2a2d35;
-        background: #1e2129;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-      }
-      .video-header h1 {
-        font-size: 18px;
-        font-weight: 500;
-        color: #fff;
-      }
-      .upload-new-btn {
-        padding: 8px 16px;
-        background: #2a2d35;
-        border: 1px solid #3a3d45;
-        border-radius: 6px;
-        color: #e0e0e0;
-        cursor: pointer;
-        font-size: 13px;
-      }
-      .upload-new-btn:hover {
-        background: #3a3d45;
-      }
-      .video-container {
-        flex: 1;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        padding: 20px;
-      }
-      #mainVideo {
-        width: 100%;
-        max-width: 100%;
-        border-radius: 8px;
-        box-shadow: 0 4px 20px rgba(0,0,0,0.5);
-      }
-      
-      .segments-panel {
-        flex: 1;
-        display: flex;
-        flex-direction: column;
-        overflow: hidden;
-      }
-      .toolbar {
-        padding: 16px 20px;
-        background: #1e2129;
-        border-bottom: 1px solid #2a2d35;
-        display: flex;
-        gap: 10px;
-        flex-wrap: wrap;
-        align-items: center;
-      }
-      .toolbar button, .toolbar label {
-        padding: 8px 16px;
-        background: #2a2d35;
-        border: 1px solid #3a3d45;
-        border-radius: 6px;
-        color: #e0e0e0;
-        cursor: pointer;
-        font-size: 13px;
-        transition: all 0.2s;
-      }
-      .toolbar button:hover {
-        background: #3a3d45;
-        border-color: #4a4d55;
-      }
-      .toolbar button.primary {
-        background: #5b7cff;
-        border-color: #5b7cff;
-        color: white;
-        font-weight: 500;
-      }
-      .toolbar button.primary:hover {
-        background: #4a6bef;
-      }
-      .toolbar button:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
-      }
-      .toolbar input[type="checkbox"] {
-        margin-right: 6px;
-      }
-      .stats {
-        display: flex;
-        gap: 20px;
-        padding: 12px 20px;
-        background: #1a1d24;
-        border-bottom: 1px solid #2a2d35;
-        font-size: 13px;
-      }
-      .stat-item {
-        color: #888;
-      }
-      .stat-item strong {
-        color: #e0e0e0;
-        margin-left: 4px;
-      }
-      
-      .segments-list {
-        flex: 1;
-        overflow-y: auto;
-        padding: 0;
-      }
-      .segments-list::-webkit-scrollbar {
-        width: 8px;
-      }
-      .segments-list::-webkit-scrollbar-track {
-        background: #1a1d24;
-      }
-      .segments-list::-webkit-scrollbar-thumb {
-        background: #3a3d45;
-        border-radius: 4px;
-      }
-      
-      .segment-row {
-        display: grid;
-        grid-template-columns: 50px 100px 100px 1fr 120px auto;
-        gap: 12px;
-        padding: 16px 20px;
-        border-bottom: 1px solid #2a2d35;
-        align-items: center;
-        transition: background 0.2s;
-        cursor: pointer;
-      }
-      .segment-row:hover {
-        background: #1e2129;
-      }
-      .segment-row.selected {
-        background: #1e2533;
-        border-left: 3px solid #5b7cff;
-        padding-left: 17px;
-      }
-      .segment-row.keyword {
-        border-left: 3px solid #ff6b6b;
-        padding-left: 17px;
-      }
-      .segment-row.selected.keyword {
-        border-left: 3px solid #5b7cff;
-      }
-      .segment-row.active {
-        background: #252933 !important;
-      }
-      
-      .segment-id {
-        color: #666;
-        font-size: 13px;
-        text-align: center;
-      }
-      .segment-time {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        padding: 6px 12px;
-        background: #2a2d35;
-        border-radius: 6px;
-        font-size: 12px;
-        font-family: 'Courier New', monospace;
-        color: #aaa;
-      }
-      .segment-text {
-        color: #e0e0e0;
-        font-size: 14px;
-        line-height: 1.5;
-      }
-      .segment-info {
-        display: flex;
-        flex-direction: column;
-        align-items: flex-end;
-        gap: 4px;
-        font-size: 12px;
-        color: #666;
-      }
-      .segment-score {
-        color: #ff6b6b;
-        font-weight: 600;
-      }
-      .segment-actions {
-        display: flex;
-        gap: 6px;
-      }
-      .segment-checkbox {
-        width: 18px;
-        height: 18px;
-        cursor: pointer;
-        accent-color: #5b7cff;
-      }
-      .icon-btn {
-        width: 32px;
-        height: 32px;
-        border: none;
-        background: #2a2d35;
-        color: #888;
-        border-radius: 6px;
-        cursor: pointer;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        transition: all 0.2s;
-        font-size: 16px;
-      }
-      .icon-btn:hover {
-        background: #3a3d45;
-        color: #e0e0e0;
-      }
-      
-      .advanced-section {
-        padding: 16px 20px;
-        background: #1e2129;
-        border-bottom: 1px solid #2a2d35;
-        display: none;
-      }
-      .advanced-section.visible {
-        display: block;
-      }
-      .slider-control {
-        margin: 12px 0;
-      }
-      .slider-control label {
-        display: flex;
-        justify-content: space-between;
-        margin-bottom: 8px;
-        font-size: 13px;
-        color: #aaa;
-      }
-      .slider-control input[type="range"] {
-        width: 100%;
-        height: 6px;
-        background: #2a2d35;
-        border-radius: 3px;
-        outline: none;
-      }
-      .slider-control input[type="range"]::-webkit-slider-thumb {
-        width: 16px;
-        height: 16px;
-        background: #5b7cff;
-        border-radius: 50%;
-        cursor: pointer;
-      }
-      .score-badge {
-        padding: 4px 10px;
-        background: #5b7cff;
-        color: white;
-        border-radius: 4px;
-        font-weight: 600;
-      }
-      .preview-info {
-        margin-top: 12px;
-        padding: 12px;
-        background: #2a2d35;
-        border-radius: 6px;
-        font-size: 13px;
-        display: none;
-      }
-      .preview-info.visible {
-        display: block;
-      }
-      
-      .download-link {
-        display: none;
-        margin: 12px 20px;
-        padding: 12px 16px;
-        background: #28a745;
-        color: white;
-        text-decoration: none;
-        border-radius: 6px;
-        text-align: center;
-        font-size: 14px;
-        font-weight: 500;
-      }
-      .download-link.visible {
-        display: block;
-      }
-      .download-link:hover {
-        background: #218838;
-      }
-      .download-row {
-        display: none;
-        gap: 10px;
-        margin: 12px 20px;
-        align-items: stretch;
-      }
-      .download-row.visible {
-        display: flex;
-      }
-      .download-row .download-link {
-        display: block;
-        flex: 1;
-        margin: 0;
-      }
-      .discard-btn {
-        padding: 12px 16px;
-        background: #2a2d35;
-        border: 1px solid #dc3545;
-        color: #dc3545;
-        border-radius: 6px;
-        cursor: pointer;
-        font-size: 14px;
-        font-weight: 500;
-      }
-      .discard-btn:hover {
-        background: #dc3545;
-        color: white;
-      }
-
-      /* Upload interface */
-      .upload-container {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        height: 100vh;
-        background: #1a1d24;
-        padding: 40px;
-      }
-      .upload-box {
-        background: #1e2129;
-        border: 2px dashed #3a3d45;
-        border-radius: 12px;
-        padding: 60px;
-        text-align: center;
-        max-width: 600px;
-        width: 100%;
-      }
-      .upload-box h1 {
-        color: #fff;
-        margin-bottom: 20px;
-        font-size: 28px;
-      }
-      .upload-box p {
-        color: #aaa;
-        margin-bottom: 30px;
-        font-size: 16px;
-      }
-      .upload-input {
-        display: none;
-      }
-      .upload-button {
-        padding: 16px 32px;
-        background: #5b7cff;
-        color: white;
-        border: none;
-        border-radius: 8px;
-        font-size: 16px;
-        font-weight: 500;
-        cursor: pointer;
-        transition: background 0.2s;
-      }
-      .upload-button:hover {
-        background: #4a6bef;
-      }
-      .upload-button:disabled {
-        background: #3a3d45;
-        cursor: not-allowed;
-        opacity: 0.5;
-      }
-      .progress-bar {
-        width: 100%;
-        height: 8px;
-        background: #2a2d35;
-        border-radius: 4px;
-        margin-top: 20px;
-        overflow: hidden;
-        display: none;
-      }
-      .progress-bar.visible {
-        display: block;
-      }
-      .progress-fill {
-        height: 100%;
-        background: #5b7cff;
-        transition: width 0.3s;
-        width: 0%;
-      }
-      .status-message {
-        margin-top: 20px;
-        color: #aaa;
-        font-size: 14px;
-        display: none;
-      }
-      .status-message.visible {
-        display: block;
-      }
-    `;
-    document.head.appendChild(style);
-  }
-  
   function showUploadInterface(errorMessage = "") {
+    disposeShell();
     const app = document.getElementById("app")!;
     const video = app.querySelector("video");
     if (video) {
@@ -569,35 +437,25 @@ interface Segment {
       video.load();
     }
     
-    app.innerHTML = `
-      <div class="upload-container">
-        <div class="upload-box">
-          <h1>🎬 Video Segment Selector</h1>
-          <p>Upload a video file to get started</p>
+    app.innerHTML = shellMarkup(`
+        <main class="upload-box" aria-labelledby="importHeading">
+          <h2 id="importHeading">Import a recording</h2>
+          <p>Choose a video to prepare its transcript and review clips.</p>
           <input type="file" id="videoInput" class="upload-input" accept="video/*">
           <button id="uploadButton" class="upload-button">Choose Video File</button>
-          <div class="progress-bar" id="progressBar">
-            <div class="progress-fill" id="progressFill"></div>
-          </div>
-          <div class="status-message" id="statusMessage">Uploading...</div>
-        </div>
-      </div>
-    `;
+        </main>
+    `);
+    const { activity } = setupShell();
   
-    mountSubtitles(app.querySelector(".upload-box")!);
+    mountSubtitles(app.querySelector(".upload-box")!, activity);
     const videoInput = document.getElementById("videoInput") as HTMLInputElement;
     const uploadButton = document.getElementById("uploadButton") as HTMLButtonElement;
-    const progressBar = document.getElementById("progressBar")!;
-    const progressFill = document.getElementById("progressFill") as HTMLDivElement;
-    const statusMessage = document.getElementById("statusMessage")!;
     if (errorMessage) {
-      statusMessage.textContent = errorMessage;
-      statusMessage.style.color = "#ff6b6b";
-      statusMessage.setAttribute("role", "alert");
-      statusMessage.classList.add("visible");
+      activity.error("Recording", errorMessage, "Choose Video File to retry.");
     }
   
     uploadButton.addEventListener("click", () => videoInput.click());
+    uploadButton.focus();
   
     videoInput.addEventListener("change", async (e) => {
       const file = (e.target as HTMLInputElement).files?.[0];
@@ -608,12 +466,7 @@ interface Segment {
       uploadButton.disabled = true;
       app.querySelectorAll<HTMLButtonElement>("button[data-format]").forEach(button => button.disabled = true);
       uploadButton.textContent = "Uploading...";
-      progressBar.classList.add("visible");
-      statusMessage.classList.add("visible");
-      statusMessage.textContent = "Uploading video...";
-      statusMessage.style.color = "";
-      statusMessage.removeAttribute("role");
-      progressFill.style.width = "0%";
+      activity.status("Import", "Uploading video…");
   
       const formData = new FormData();
       formData.append("video", file);
@@ -628,7 +481,7 @@ interface Segment {
   
         if (response.ok && result.status === "ok" && typeof result.task_id === "string" && result.task_id) {
           const taskId = result.task_id;
-          statusMessage.textContent = "Processing video...";
+          activity.status("Import", "Processing video…");
           
           // Sequential polling stays inside the upload error handler and stops
           // when this screen is replaced. Bindings belong to its fresh nodes.
@@ -639,16 +492,11 @@ interface Segment {
             if (!statusResponse.ok) throw new Error("Could not check video processing status.");
             const status = await statusResponse.json();
   
-            if (status.progress) {
-              progressFill.style.width = `${status.progress}%`;
-            }
-            
-            statusMessage.textContent = status.message || "Processing...";
+            activity.status("Import", status.message || "Processing…", status.progress);
   
             if (status.status === "complete") {
-              statusMessage.textContent = "Complete! Loading segments...";
-              progressFill.style.width = "100%";
-              await main();
+              activity.finish("Import", "Complete! Loading segments…");
+              await main(file.name);
               return;
             } else if (status.status === "error") {
               throw new Error(status.message || "Video processing failed.");
@@ -661,135 +509,130 @@ interface Segment {
         }
       } catch (err) {
         console.error(err);
-        statusMessage.textContent = `Upload failed: ${err}`;
-        statusMessage.style.color = "#ff6b6b";
+        activity.finish("Import", "Ready to retry");
+        activity.error("Import", err instanceof Error ? err.message : "Upload failed", "Choose the video file again to retry.");
         uploadButton.disabled = false;
         uploadButton.textContent = "Choose Video File";
       }
     });
   }
   
-  function buildMainUI(segments: Segment[], videoId: string) {
+  function buildMainUI(segments: Segment[], videoId: string, recordingName?: string, source: SourceReference | null = null) {
     const app = document.getElementById("app")!;
-    
-    app.innerHTML = `
-      <div class="main-container">
-        <div class="video-panel">
-          <div class="video-header">
-            <h1>Video Segment Selector</h1>
-            <button class="upload-new-btn" id="uploadNewBtn">📤 Upload New</button>
-          </div>
-          <div class="video-container">
-            <video id="mainVideo" controls></video>
-          </div>
+    app.innerHTML = shellMarkup(`
+      <aside class="side-panel" id="mediaPanel" aria-labelledby="mediaHeading">
+        <div class="panel-heading"><h2 id="mediaHeading" tabindex="-1">Media</h2>
+          <button class="drawer-close" aria-label="Close Media">Close</button></div>
+        <div class="side-body" id="mediaBody">
+          <button id="uploadNewBtn">Upload New</button>
+          <p class="source-info" id="sourceInfo"></p>
+          <p class="field-help" id="sourceDurationInfo"></p>
         </div>
-        
-        <div class="segments-panel">
+      </aside>
+      <main class="central-editor" id="centralEditor">
+        <section class="preview-panel" aria-labelledby="previewHeading">
+          <div class="preview-heading"><h2 id="previewHeading">Preview</h2><span id="activeSegmentContext"></span></div>
+          <div class="video-container"><video id="mainVideo" controls preload="metadata" aria-label="Original recording preview"></video>
+            <p id="sourcePreviewStatus" class="source-preview-status" hidden></p></div>
+          <div class="playback-dock">Playback time on the original recording</div>
+          <div class="clip-context">
+            <h2 id="clipContextHeading">Reviewing segment</h2>
+            <p id="clipContextText"></p>
+            <p class="field-help" id="clipContextTiming"></p>
+            <p class="field-help">Review freely. Check clips in the transcript to include them in your reel.</p>
+          </div>
+        </section>
+        <section class="segments-panel" aria-labelledby="transcriptHeading">
+          <h2 class="transcript-heading" id="transcriptHeading" tabindex="-1">Transcript</h2>
           <div class="toolbar">
             <button id="selectAll">Select All</button>
             <button id="selectNone">Deselect All</button>
             <button id="selectKeywords" class="primary">Select Keywords</button>
-            <label>
-              <input type="checkbox" id="showOnlyKeywords">
-              Keyword Only
-            </label>
-            <button id="advancedToggle">⚙️ Advanced</button>
+            <label><input type="checkbox" id="showOnlyKeywords"> Keyword Only</label>
           </div>
-          
-          <div class="advanced-section" id="advancedSection">
-            <div class="slider-control">
-              <label>
-                <span>Minimum Score Threshold</span>
-                <span class="score-badge" id="scoreValue">7</span>
-              </label>
-              <input type="range" id="minScoreSlider" min="1" max="10" value="7" step="1">
-            </div>
-            <div style="margin-top: 12px;">
-              <label style="display: block; margin-bottom: 6px; font-size: 13px;">
-                AI instructions <span style="opacity: 0.6;">(required — describe what counts as a highlight)</span>
-              </label>
-              <textarea id="aiInstructions" rows="3"
-                placeholder="e.g. Focus on goals, great saves and heated moments. Ignore casual banter and replays."
-                style="width: 100%; box-sizing: border-box; background: #2a2d35; border: 1px solid #3a3d45; color: #e0e0e0; border-radius: 6px; padding: 8px; font-size: 13px; font-family: inherit; resize: vertical;"></textarea>
-              <label style="display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 13px; cursor: pointer;">
-                <input type="checkbox" id="rescoreCheck"> Re-run AI scoring (otherwise scores from the same instructions are reused)
-              </label>
-            </div>
-              <div id="llmSettingsPanel" style="display: none; margin-top: 10px; padding: 12px; background: #23262e; border: 1px solid #3a3d45; border-radius: 6px;">
-                <div style="font-size: 12px; opacity: 0.7; margin-bottom: 10px;">
-                  Scoring runs against a local model server if one is running (Ollama at
-                  127.0.0.1:11434 by default), otherwise against the API below with your own key.
-                </div>
-                <label style="display: block; font-size: 12px; margin-bottom: 4px;">API base URL</label>
-                <input id="llmBaseUrl" type="text" placeholder="https://api.openai.com/v1"
-                  style="width: 100%; box-sizing: border-box; background: #2a2d35; border: 1px solid #3a3d45; color: #e0e0e0; border-radius: 6px; padding: 6px 8px; font-size: 12px; margin-bottom: 8px;">
-                <label style="display: block; font-size: 12px; margin-bottom: 4px;">Model</label>
-                <input id="llmModel" type="text" placeholder="gpt-4o-mini"
-                  style="width: 100%; box-sizing: border-box; background: #2a2d35; border: 1px solid #3a3d45; color: #e0e0e0; border-radius: 6px; padding: 6px 8px; font-size: 12px; margin-bottom: 8px;">
-                <label style="display: block; font-size: 12px; margin-bottom: 4px;">API key <span style="opacity: 0.6;">(stored on this machine only, never in the browser)</span></label>
-                <input id="llmApiKey" type="password" autocomplete="off"
-                  style="width: 100%; box-sizing: border-box; background: #2a2d35; border: 1px solid #3a3d45; color: #e0e0e0; border-radius: 6px; padding: 6px 8px; font-size: 12px; margin-bottom: 8px;">
-                <label style="display: block; font-size: 12px; margin-bottom: 4px;">Local server URL</label>
-                <input id="llmLocalUrl" type="text" placeholder="http://127.0.0.1:11434"
-                  style="width: 100%; box-sizing: border-box; background: #2a2d35; border: 1px solid #3a3d45; color: #e0e0e0; border-radius: 6px; padding: 6px 8px; font-size: 12px; margin-bottom: 8px;">
-                <label style="display: block; font-size: 12px; margin-bottom: 4px;">Local model</label>
-                <input id="llmLocalModel" type="text" placeholder="qwen2.5:7b-instruct"
-                  style="width: 100%; box-sizing: border-box; background: #2a2d35; border: 1px solid #3a3d45; color: #e0e0e0; border-radius: 6px; padding: 6px 8px; font-size: 12px; margin-bottom: 10px;">
-                <div style="display: flex; gap: 8px;">
-                  <button id="llmSaveBtn" style="flex: 1; padding: 8px; background: #5b7cff; border: 1px solid #5b7cff; color: white; border-radius: 6px; cursor: pointer; font-size: 12px;">Save</button>
-                  <button id="llmTestBtn" style="flex: 1; padding: 8px; background: #2a2d35; border: 1px solid #3a3d45; color: #e0e0e0; border-radius: 6px; cursor: pointer; font-size: 12px;">Test Connection</button>
-                </div>
-                <div id="llmTestResult" style="font-size: 12px; margin-top: 8px;"></div>
-              </div>
-            <div style="display: flex; gap: 10px; margin-top: 12px;">
-              <button id="previewBtn" style="flex: 1; padding: 10px; background: #2a2d35; border: 1px solid #3a3d45; color: #e0e0e0; border-radius: 6px; cursor: pointer; font-size: 13px;">Selection Statistics</button>
-              <button id="resetSettingsBtn" style="padding: 10px 16px; background: #2a2d35; border: 1px solid #3a3d45; color: #e0e0e0; border-radius: 6px; cursor: pointer; font-size: 13px;">Reset Threshold</button>
-            </div>
-            <div class="preview-info" id="previewInfo"></div>
-            <div class="download-row" id="autoDownloadRow">
-              <a id="autoDownloadLink" class="download-link">Download Auto-Generated Reel</a>
-              <button id="discardAutoBtn" class="discard-btn" title="Discard this reel to try a new prompt or pick clips manually">Discard</button>
-            </div>
-          </div>
-          
           <div class="stats">
             <div class="stat-item">Total: <strong>${segments.length}</strong></div>
             <div class="stat-item">Selected: <strong id="selectedCount">0</strong></div>
             <div class="stat-item">Duration: <strong id="selectedDuration">0.0s</strong></div>
+            <span id="filterSummary" role="status"></span>
           </div>
-          
           <div class="segments-list" id="segmentsList"></div>
-          
-          <div id="generationControls" style="padding: 16px 20px; border-top: 1px solid #2a2d35; background: #1e2129;">
-            <div id="generationCriteria" style="font-size: 13px; margin-bottom: 6px;"></div>
-            <div id="generationThreshold" style="font-size: 13px; margin-bottom: 6px;"></div>
-            <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px;">
-              <span id="llmStatus" role="status" style="font-size: 13px;">Checking AI backend...</span>
-              <button id="llmSettingsToggle" style="padding: 6px 12px; background: #2a2d35; border: 1px solid #3a3d45; color: #e0e0e0; border-radius: 6px; cursor: pointer; font-size: 12px; white-space: nowrap;">AI Settings</button>
+        </section>
+      </main>
+      <aside class="side-panel" id="contextPanel" aria-labelledby="contextHeading">
+        <div class="panel-heading"><h2 id="contextHeading" tabindex="-1">AI Highlights</h2>
+          <button class="drawer-close" aria-label="Close AI Highlights">Close</button></div>
+        <div class="side-body">
+          <div id="generationControls">
+            <label class="criteria-label" for="aiInstructions">What moments do you want to find?</label>
+            <p class="field-help" id="criteriaHelp">Required. Describe what to keep and what to leave out.</p>
+            <textarea id="aiInstructions" rows="4" required aria-describedby="criteriaHelp"
+              placeholder="e.g. Big plays, surprising reactions and funny exchanges. Skip pauses and repeated moments."></textarea>
+            <div class="provider-row">
+              <span id="llmStatus" role="status">Checking AI backend…</span>
+              <button id="llmSettingsToggle" aria-expanded="false" aria-controls="llmSettingsPanel">AI Settings</button>
             </div>
-            <div id="llmNotice" style="font-size: 12px; opacity: 0.75; margin: 6px 0 10px; line-height: 1.4;"></div>
-            <div style="display: flex; gap: 10px;">
-              <button id="autoGenerateBtn" disabled style="flex: 1; padding: 12px; background: #5b7cff; border: 1px solid #5b7cff; color: white; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500;">
-                ✨ Auto-Generate Highlight Reel
-              </button>
-              <button id="exportBtn" style="flex: 1; padding: 12px; background: #28a745; border: 1px solid #28a745; color: white; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; opacity: 0.3; cursor: not-allowed;" disabled>
-                Create Highlight Reel
-              </button>
+            <p id="llmNotice" class="field-help"></p>
+            <div id="generationThreshold" class="field-help"></div>
+            <p class="generation-outcome">Creates a separate AI reel. Your checked clips stay unchanged.</p>
+            <button id="autoGenerateBtn" disabled aria-describedby="generationHint">Auto-Generate Highlight Reel</button>
+            <p id="generationHint" class="field-help">Describe your moments above to enable Auto-Generate.</p>
+          </div>
+
+          <button id="advancedToggle" aria-expanded="false" aria-controls="advancedSection">Scoring options</button>
+          <div class="advanced-section" id="advancedSection">
+            <div class="slider-control">
+              <label for="minScoreSlider"><span>Minimum score</span><span class="score-badge" id="scoreValue">7</span></label>
+              <input type="range" id="minScoreSlider" min="1" max="10" value="7" step="1">
             </div>
-            <a id="downloadLink" class="download-link">Download Highlight Reel</a>
+            <label class="rescore-control"><input type="checkbox" id="rescoreCheck"> Re-run AI scoring</label>
+            <p class="field-help">Otherwise, scores from the same instructions are reused.</p>
+            <div class="context-actions">
+              <button id="previewBtn">Selection Statistics</button>
+              <button id="resetSettingsBtn">Reset Threshold</button>
+            </div>
+            <div class="preview-info" id="previewInfo" role="status"></div>
+          </div>
+
+          <div id="llmSettingsPanel" class="provider-settings" style="display: none;">
+            <p class="field-help">Scoring uses a local model server if one is running (Ollama at 127.0.0.1:11434 by default), otherwise the API below with your own key.</p>
+            <label for="llmBaseUrl">API base URL</label>
+            <input id="llmBaseUrl" type="text" placeholder="https://api.openai.com/v1">
+            <label for="llmModel">Model</label>
+            <input id="llmModel" type="text" placeholder="gpt-4o-mini">
+            <label for="llmApiKey">API key</label>
+            <p class="field-help">Stored on this machine only, never in browser storage.</p>
+            <input id="llmApiKey" type="password" autocomplete="off">
+            <label for="llmLocalUrl">Local server URL</label>
+            <input id="llmLocalUrl" type="text" placeholder="http://127.0.0.1:11434">
+            <label for="llmLocalModel">Local model</label>
+            <input id="llmLocalModel" type="text" placeholder="qwen2.5:7b-instruct">
+            <p class="field-help" id="llmSettingsHint" role="status">Test Connection uses saved settings. Save any changes first.</p>
+            <div class="context-actions">
+              <button id="llmSaveBtn" class="primary">Save</button>
+              <button id="llmTestBtn" aria-describedby="llmSettingsHint">Test Connection</button>
+            </div>
+            <div id="llmTestResult" role="status"></div>
           </div>
         </div>
-      </div>
-    `;
-  
-    setupEventListeners(segments, videoId);
+      </aside>
+      <div class="drawer-backdrop" id="drawerBackdrop"></div>
+    `, true);
+    const context = recordingName || "Current recording";
+    document.getElementById("recordingContext")!.textContent = context;
+    document.getElementById("recordingContext")!.title = context;
+    document.getElementById("sourceInfo")!.textContent = `${context} · ${segments.length} segments · ${segments.reduce((sum, segment) => sum + segment.duration, 0).toFixed(1)}s of clips`;
+    const shell = setupShell();
+    setupEventListeners(segments, videoId, shell, source);
+    document.getElementById("transcriptHeading")!.focus();
   }
-  
-  function setupEventListeners(segments: Segment[], videoId: string) {
+
+  function setupEventListeners(segments: Segment[], videoId: string, shell: ReturnType<typeof setupShell>, source: SourceReference | null) {
+    const { activity } = shell;
     const segmentsList = document.getElementById("segmentsList")!;
     const mainVideo = document.getElementById("mainVideo") as HTMLVideoElement;
     const exportBtn = document.getElementById("exportBtn") as HTMLButtonElement;
-    mountSubtitles(document.querySelector(".video-panel")!);
+    mountSubtitles(document.getElementById("mediaBody")!, activity);
     const downloadLink = document.getElementById("downloadLink") as HTMLAnchorElement;
     const autoGenerateBtn = document.getElementById("autoGenerateBtn") as HTMLButtonElement;
     const autoDownloadLink = document.getElementById("autoDownloadLink") as HTMLAnchorElement;
@@ -801,7 +644,6 @@ interface Segment {
     const previewInfo = document.getElementById("previewInfo")!;
     const minScoreSlider = document.getElementById("minScoreSlider") as HTMLInputElement;
     const instructionsInput = document.getElementById("aiInstructions") as HTMLTextAreaElement;
-    const generationCriteria = document.getElementById("generationCriteria")!;
     const generationThreshold = document.getElementById("generationThreshold")!;
     const scoreValue = document.getElementById("scoreValue")!;
     const resetSettingsBtn = document.getElementById("resetSettingsBtn") as HTMLButtonElement;
@@ -823,12 +665,24 @@ interface Segment {
     const llmTestResult = document.getElementById("llmTestResult")!;
 
     const selectedIds = new Set<number>();
-    let currentSegmentId: number | null = segments.length > 0 ? segments[0].id : null;
+    let currentSegmentId: number | null = null;
     let llmAvailable = false;
     let autoGenerating = false;
     let exporting = false;
 
-    // Native controls own the current values even while Advanced is hidden.
+    function setAdvanced(open: boolean) {
+      if (!open && advancedSection.contains(document.activeElement)) advancedToggle.focus();
+      advancedSection.classList.toggle("visible", open);
+      advancedToggle.setAttribute("aria-expanded", String(open));
+    }
+
+    function updateProviderSummary() {
+      const summary = document.getElementById("contextProviderSummary")!;
+      summary.textContent = llmStatus.textContent;
+      summary.title = llmStatus.textContent || "";
+    }
+
+    // Native inputs retain current values while scoring options are hidden.
     // Both request paths take the same snapshot; panel visibility is only UI state.
     function readScoringSelection() {
       return { min_score: Number(minScoreSlider.value), instructions: instructionsInput.value.trim() };
@@ -837,16 +691,17 @@ interface Segment {
     function updateScoringSummary() {
       const selection = readScoringSelection();
       scoreValue.textContent = String(selection.min_score);
-      generationCriteria.textContent = selection.instructions
-        ? `Criteria: ${selection.instructions}` : "Criteria: required — describe highlights in Advanced.";
       generationThreshold.textContent = `Score threshold: ${selection.min_score}+`;
       previewInfo.classList.remove("visible");
+      instructionsInput.removeAttribute("aria-invalid");
+      setAutoGenerateEnabled(llmAvailable);
     }
 
     function setAutoGenerateEnabled(enabled: boolean) {
-      autoGenerateBtn.disabled = !enabled || autoGenerating;
-      autoGenerateBtn.style.opacity = autoGenerateBtn.disabled ? "0.5" : "1";
-      autoGenerateBtn.style.cursor = autoGenerateBtn.disabled ? "not-allowed" : "pointer";
+      autoGenerateBtn.disabled = !enabled || autoGenerating || !instructionsInput.value.trim();
+      document.getElementById("generationHint")!.textContent = !instructionsInput.value.trim()
+        ? "Describe your moments above to enable Auto-Generate."
+        : !enabled ? "Configure or test AI Settings to enable Auto-Generate." : "";
     }
 
     async function refreshLlmStatus() {
@@ -854,10 +709,20 @@ interface Segment {
         const response = await fetch("/api/llm-settings");
         if (!response.ok) throw new Error("Could not check AI backend status.");
         const s = await response.json();
-        llmBaseUrl.value = s.base_url || "";
-        llmModel.value = s.model || "";
-        llmLocalUrl.value = s.local_url || "";
-        llmLocalModel.value = s.local_model || "";
+        activity.clearError("AI status");
+        const nextSaved = {
+          base_url: s.base_url || "", model: s.model || "", api_key: "",
+          local_url: s.local_url || "", local_model: s.local_model || ""
+        };
+        // Refresh saved values only where the user has no draft edit, including
+        // edits made while Save/Test or the initial status request is in flight.
+        for (const key of providerKeys) {
+          if (providerFields[key].value === savedProviderValues[key]) {
+            providerFields[key].value = nextSaved[key];
+          }
+        }
+        savedProviderValues = nextSaved;
+        updateProviderForm();
         llmApiKey.placeholder = s.has_api_key ? "(saved - enter a new key to replace)" : "";
 
         llmAvailable = !!s.resolved_backend;
@@ -883,16 +748,50 @@ interface Segment {
         setAutoGenerateEnabled(false);
         llmStatus.textContent = "AI backend: status unavailable";
         llmNotice.textContent = "Auto-Generate is disabled. Check the backend connection, then save or test your AI Settings to retry.";
+        activity.error("AI status", "Could not check AI backend status.", "Check the backend connection, then Save or Test AI Settings to retry.");
       }
+      updateProviderSummary();
     }
 
     llmSettingsToggle.addEventListener("click", () => {
       const isOpen = llmSettingsPanel.style.display !== "none";
+      if (isOpen && llmSettingsPanel.contains(document.activeElement)) llmSettingsToggle.focus();
       llmSettingsPanel.style.display = isOpen ? "none" : "block";
-      advancedSection.classList.add("visible");
+      llmSettingsToggle.setAttribute("aria-expanded", String(!isOpen));
+      if (!isOpen) llmBaseUrl.focus();
     });
 
+    const providerFields = {
+      base_url: llmBaseUrl, model: llmModel, api_key: llmApiKey,
+      local_url: llmLocalUrl, local_model: llmLocalModel
+    };
+    const providerKeys = Object.keys(providerFields) as (keyof typeof providerFields)[];
+    function readProviderDraft() {
+      return Object.fromEntries(providerKeys.map(key => [key, providerFields[key].value])) as Record<keyof typeof providerFields, string>;
+    }
+    let savedProviderValues = readProviderDraft();
+    let providerBusy = false;
+    function providerHasChanges() {
+      return providerKeys.some(key => providerFields[key].value !== savedProviderValues[key]);
+    }
+    function updateProviderForm() {
+      const dirty = providerHasChanges();
+      llmSaveBtn.disabled = providerBusy;
+      llmTestBtn.disabled = providerBusy || dirty;
+      document.getElementById("llmSettingsHint")!.textContent = dirty
+        ? "Unsaved changes. Save before testing the connection."
+        : "Test Connection uses saved settings. Save any changes first.";
+    }
+    for (const field of Object.values(providerFields)) {
+      field.addEventListener("input", () => {
+        llmTestResult.textContent = "";
+        updateProviderForm();
+      });
+    }
+
     llmSaveBtn.addEventListener("click", async () => {
+      if (providerBusy) return;
+      const submittedDraft = readProviderDraft();
       const payload: Record<string, string> = {
         base_url: llmBaseUrl.value.trim(),
         model: llmModel.value.trim(),
@@ -902,8 +801,10 @@ interface Segment {
       // A blank key field means "keep the saved key", not "clear it".
       if (llmApiKey.value.trim()) payload.api_key = llmApiKey.value.trim();
 
-      llmSaveBtn.disabled = true;
+      providerBusy = true;
+      updateProviderForm();
       llmSaveBtn.textContent = "Saving...";
+      if (!autoGenerating && !exporting) activity.status("AI Settings", "Saving…");
       try {
         const response = await fetch("/api/llm-settings", {
           method: "POST",
@@ -911,30 +812,42 @@ interface Segment {
           body: JSON.stringify(payload)
         });
         const result = await response.json();
-        if (result.status === "ok") {
-          llmApiKey.value = "";
+        if (response.ok && result.status === "ok") {
+          if (llmApiKey.value === submittedDraft.api_key) llmApiKey.value = "";
+          savedProviderValues = { ...submittedDraft, api_key: "" };
           llmTestResult.textContent = "Settings saved.";
-          llmTestResult.style.color = "#7ee08a";
+          llmTestResult.style.color = "var(--iris-sage)";
+          activity.clearError("AI Settings");
           await refreshLlmStatus();
         } else {
           llmTestResult.textContent = `Error: ${result.message || "could not save settings"}`;
-          llmTestResult.style.color = "#ff8a8a";
+          llmTestResult.style.color = "var(--studio-error)";
+          activity.error("AI Settings", result.message || "Could not save settings.", "Open AI Settings and retry Save.");
         }
       } catch (err) {
         console.error(err);
         llmTestResult.textContent = "Error: could not save settings";
-        llmTestResult.style.color = "#ff8a8a";
+        llmTestResult.style.color = "var(--studio-error)";
+        activity.error("AI Settings", "Could not save settings.", "Check the backend connection and retry Save.");
       } finally {
-        llmSaveBtn.disabled = false;
+        providerBusy = false;
+        updateProviderForm();
         llmSaveBtn.textContent = "Save";
+        activity.finish("AI Settings", llmTestResult.textContent || "Ready");
       }
     });
 
     llmTestBtn.addEventListener("click", async () => {
-      llmTestBtn.disabled = true;
+      if (providerBusy || providerHasChanges()) {
+        updateProviderForm();
+        return;
+      }
+      providerBusy = true;
+      updateProviderForm();
       llmTestBtn.textContent = "Testing...";
       llmTestResult.textContent = "Contacting the model...";
-      llmTestResult.style.color = "#e0e0e0";
+      llmTestResult.style.color = "var(--studio-text)";
+      if (!autoGenerating && !exporting) activity.status("AI connection", "Testing…");
       try {
         const response = await fetch("/api/llm-test", {
           method: "POST",
@@ -944,37 +857,76 @@ interface Segment {
         const result = await response.json();
         if (response.ok && result.status === "ok") {
           llmTestResult.textContent = `Connected: ${result.backend} backend, model ${result.model}.`;
-          llmTestResult.style.color = "#7ee08a";
+          llmTestResult.style.color = "var(--iris-sage)";
+          activity.clearError("AI connection");
           await refreshLlmStatus();
         } else {
           llmTestResult.textContent = `Failed: ${result.message}`;
-          llmTestResult.style.color = "#ff8a8a";
+          llmTestResult.style.color = "var(--studio-error)";
           llmAvailable = false;
           setAutoGenerateEnabled(false);
           llmStatus.textContent = "AI scoring: connection failed";
           llmNotice.textContent = `${result.message} Check AI Settings and test the connection again.`;
+          activity.error("AI connection", result.message || "Connection failed.", "Check AI Settings and test again.");
         }
       } catch (err) {
         console.error(err);
         llmTestResult.textContent = "Failed: could not reach the backend server.";
-        llmTestResult.style.color = "#ff8a8a";
+        llmTestResult.style.color = "var(--studio-error)";
         llmAvailable = false;
         setAutoGenerateEnabled(false);
         llmStatus.textContent = "AI scoring: connection failed";
         llmNotice.textContent = "Could not reach the backend server. Check the backend connection and test AI Settings again.";
+        activity.error("AI connection", "Could not reach the backend server.", "Check AI Settings and test again.");
       } finally {
-        llmTestBtn.disabled = false;
+        providerBusy = false;
+        updateProviderForm();
         llmTestBtn.textContent = "Test Connection";
+        updateProviderSummary();
+        activity.finish("AI connection", llmTestResult.textContent || "Ready");
       }
     });
 
     updateScoringSummary();
     setAutoGenerateEnabled(false);
     refreshLlmStatus();
-  
-    if (segments.length > 0) {
-      mainVideo.src = `/segments/${encodeURIComponent(segments[0].filename)}`;
+
+    function updateClipContext(segment: Segment) {
+      document.getElementById("activeSegmentContext")!.textContent = `Segment ${segment.id}`;
+      document.getElementById("clipContextHeading")!.textContent = `Reviewing segment ${segment.id}`;
+      document.getElementById("clipContextText")!.textContent = segment.text;
+      document.getElementById("clipContextTiming")!.textContent =
+        `${formatTime(segment.start)} – ${formatTime(segment.end)} on recording · ${segment.duration.toFixed(1)}s clip`;
     }
+  
+    function markReviewed(segment: Segment | undefined) {
+      currentSegmentId = segment?.id ?? null;
+      if (segment) updateClipContext(segment);
+      else {
+        document.getElementById('activeSegmentContext')!.textContent = 'Original recording';
+        document.getElementById('clipContextHeading')!.textContent = 'Reviewing source footage';
+        document.getElementById('clipContextText')!.textContent = segments.length ? 'No transcript segment at this position.' : 'This recording has no transcript segments.';
+        document.getElementById('clipContextTiming')!.textContent = 'Seek anywhere in the original recording using the source timeline.';
+      }
+      segmentsList.querySelectorAll<HTMLElement>('.segment-row').forEach(row => {
+        const active = Number(row.dataset.id) === currentSegmentId;
+        row.classList.toggle('active', active);
+        const review = row.querySelector('.segment-review')!;
+        if (active) review.setAttribute('aria-current', 'true');
+        else review.removeAttribute('aria-current');
+      });
+      timeline.select(selectedIds, currentSegmentId);
+    }
+    const timeline = setupSourceTimeline(mainVideo, source, segments, time => {
+      // Keep an explicitly reviewed segment while inside an overlap; otherwise
+      // choose the first covering interval. Gaps have no active transcript row.
+      const covers = (segment: Segment) => time >= segment.start && time < segment.end;
+      const segment = segments.find(s => s.id === currentSegmentId && covers(s)) || segments.find(covers);
+      if ((segment?.id ?? null) !== currentSegmentId) markReviewed(segment);
+    });
+    const disposeCurrentShell = disposeShell;
+    disposeShell = () => { timeline.dispose(); disposeCurrentShell(); };
+    markReviewed(undefined);
   
     uploadNewBtn.addEventListener("click", () => {
       if (autoGenerating || exporting) return;
@@ -988,57 +940,63 @@ interface Segment {
       const segment = segments.find(s => s.id === segmentId);
       if (segment) {
         currentSegmentId = segmentId;
-        mainVideo.src = `/segments/${encodeURIComponent(segment.filename)}`;
-        mainVideo.currentTime = 0;
+        markReviewed(segment);
+        timeline.seek(segment.start);
+        const row = segmentsList.querySelector<HTMLElement>(`.segment-row[data-id="${segment.id}"]`);
+        row?.scrollIntoView({ block: "nearest" });
       }
-    }
-  
-    function formatTime(seconds: number): string {
-      const mins = Math.floor(seconds / 60);
-      const secs = Math.floor(seconds % 60);
-      return `${mins}:${secs.toString().padStart(2, '0')}`;
     }
   
     function updateStats() {
       selectedCountEl.textContent = selectedIds.size.toString();
+      document.getElementById("headerSelectedCount")!.textContent = `${selectedIds.size} selected`;
       const totalDur = segments
         .filter(s => selectedIds.has(s.id))
         .reduce((a, s) => a + s.duration, 0);
       selectedDurationEl.textContent = totalDur.toFixed(1) + "s";
+      updateFilterSummary();
       
       exportBtn.disabled = selectedIds.size === 0 || exporting;
-      if (exportBtn.disabled) {
-        exportBtn.style.opacity = "0.3";
-        exportBtn.style.cursor = "not-allowed";
-      } else {
-        exportBtn.style.opacity = "1";
-        exportBtn.style.cursor = "pointer";
-      }
+      timeline.select(selectedIds, currentSegmentId);
+
     }
   
+    function updateFilterSummary() {
+      const filtering = (document.getElementById("showOnlyKeywords") as HTMLInputElement).checked;
+      const hiddenSelected = segments.filter(segment => !segment.is_keyword && selectedIds.has(segment.id)).length;
+      document.getElementById("filterSummary")!.textContent = filtering
+        ? `${segments.filter(segment => segment.is_keyword).length} shown · ${hiddenSelected} selected hidden` : "";
+    }
+
     function renderSegments(filterKeywords = false) {
+      const focused = document.activeElement as HTMLElement;
+      const focusedRow = focused.closest<HTMLElement>(".segment-row");
+      const focusClass = ["segment-review", "segment-checkbox", "play-btn"].find(name => focused.classList.contains(name));
+      const scrollTop = segmentsList.scrollTop;
       segmentsList.innerHTML = "";
       segments.forEach(seg => {
         if (filterKeywords && !seg.is_keyword) return;
   
         const div = document.createElement("div");
+        div.dataset.id = String(seg.id);
         div.className = "segment-row" + 
           (seg.is_keyword ? " keyword" : "") +
           (selectedIds.has(seg.id) ? " selected" : "") +
           (currentSegmentId === seg.id ? " active" : "");
         
         div.innerHTML = `
-          <div class="segment-id">${seg.id}</div>
-          <div class="segment-time">${formatTime(seg.start)}</div>
-          <div class="segment-time">${formatTime(seg.end)}</div>
+          <button class="segment-review" data-id="${seg.id}" ${currentSegmentId === seg.id ? 'aria-current="true"' : ''} aria-label="Review segment ${seg.id}, ${formatTime(seg.start)} to ${formatTime(seg.end)}">
+            <span class="segment-id">${seg.id}</span>
+            <span class="segment-time">${formatTime(seg.start)} – ${formatTime(seg.end)}</span>
+          </button>
           <div class="segment-text"></div>
           <div class="segment-info">
-            ${seg.is_keyword ? '<span class="segment-score">CPS: High</span>' : ''}
+            ${seg.is_keyword ? '<span class="segment-score">Keyword</span>' : ''}
             <span>Duration: ${seg.duration.toFixed(1)}s</span>
           </div>
           <div class="segment-actions">
-            <input type="checkbox" class="segment-checkbox" data-id="${seg.id}" ${selectedIds.has(seg.id) ? "checked" : ""}>
-            <button class="icon-btn play-btn" data-id="${seg.id}" title="Play segment">▶</button>
+            <label class="segment-selection"><input type="checkbox" class="segment-checkbox" data-id="${seg.id}" aria-label="Select segment ${seg.id}" ${selectedIds.has(seg.id) ? "checked" : ""}></label>
+            <button class="icon-btn play-btn" data-id="${seg.id}" aria-label="Play segment ${seg.id}">Play</button>
           </div>
         `;
         div.querySelector(".segment-text")!.textContent = seg.text;
@@ -1056,21 +1014,23 @@ interface Segment {
         playBtn.addEventListener("click", (e) => {
           e.stopPropagation();
           updateVideoForSegment(seg.id);
-          mainVideo.play();
-          document.querySelectorAll('.segment-row').forEach(row => row.classList.remove('active'));
-          div.classList.add('active');
+          if (mainVideo.src) void mainVideo.play().catch(() => {});
         });
   
         div.addEventListener("click", (e) => {
-          if (!(e.target as HTMLElement).closest(".segment-checkbox, .play-btn")) {
+          if (!(e.target as HTMLElement).closest(".segment-selection, .play-btn")) {
             updateVideoForSegment(seg.id);
-            document.querySelectorAll('.segment-row').forEach(row => row.classList.remove('active'));
-            div.classList.add('active');
           }
         });
   
         segmentsList.appendChild(div);
       });
+      segmentsList.scrollTop = scrollTop;
+      if (focusedRow && focusClass) {
+        const replacement = segmentsList.querySelector<HTMLElement>(`.${focusClass}[data-id="${focusedRow.dataset.id}"]`);
+        (replacement || document.getElementById("showOnlyKeywords")!).focus({ preventScroll: true });
+      }
+      updateFilterSummary();
     }
   
     renderSegments();
@@ -1100,7 +1060,7 @@ interface Segment {
     });
   
     advancedToggle.addEventListener("click", () => {
-      advancedSection.classList.toggle("visible");
+      setAdvanced(!advancedSection.classList.contains("visible"));
     });
   
     minScoreSlider.addEventListener("input", updateScoringSummary);
@@ -1117,6 +1077,7 @@ interface Segment {
       previewBtn.disabled = true;
       previewBtn.style.opacity = "0.5";
       previewBtn.textContent = "Loading...";
+      if (!autoGenerating && !exporting) activity.status("Selection Statistics", "Loading score-filter estimate…");
       
       try {
         const response = await fetch("/api/preview-auto-export", {
@@ -1130,9 +1091,10 @@ interface Segment {
         if (current.min_score !== selection.min_score || current.instructions !== selection.instructions) return;
 
         if (response.ok && result.status === "ok") {
+          activity.clearError("Selection Statistics");
           const duration = Math.round(result.estimated_duration_seconds);
           previewInfo.replaceChildren(
-            document.createTextNode(`📊 Selection Statistics: ${result.count} highlights (of ${result.total_available} available)`),
+            document.createTextNode(`Selection Statistics: ${result.count} highlights (of ${result.total_available} available) · Score-filter estimate`),
             document.createElement("br"),
             document.createTextNode(`⏱️ Duration: ${duration}s (${Math.floor(duration/60)}:${(duration%60).toString().padStart(2,'0')})`),
             document.createElement("br"),
@@ -1141,32 +1103,34 @@ interface Segment {
           previewInfo.classList.add("visible");
         } else {
           previewInfo.classList.remove("visible");
-          alert(`Error: ${result.message}`);
+          activity.error("Selection Statistics", result.message || "Could not load statistics.", "Generate scores first if needed, then retry Selection Statistics.");
         }
       } catch (err) {
         console.error(err);
         previewInfo.classList.remove("visible");
-        alert("Failed to load selection statistics");
+        activity.error("Selection Statistics", "Failed to load selection statistics.", "Retry Selection Statistics when the backend is ready.");
       } finally {
         previewBtn.disabled = false;
         previewBtn.style.opacity = "1";
         previewBtn.textContent = "Selection Statistics";
+        activity.finish("Selection Statistics", "Ready");
       }
     });
   
     autoGenerateBtn.addEventListener("click", async () => {
       if (autoGenerating) return;
       if (!llmAvailable) {
-        advancedSection.classList.add("visible");
-        alert(llmNotice.textContent || "Check AI Settings before auto-generating.");
+        shell.openContext();
+        activity.error("Auto-generation", llmNotice.textContent || "AI is unavailable.", "Check AI Settings before auto-generating.");
         return;
       }
       const selection = readScoringSelection();
       const rescore = (document.getElementById("rescoreCheck") as HTMLInputElement).checked;
 
       if (!selection.instructions) {
-        advancedSection.classList.add("visible");
-        alert("Please describe what counts as a highlight before auto-generating.");
+        shell.openContext();
+        activity.error("Auto-generation", "Please describe what counts as a highlight before auto-generating.", "Describe your moments above and retry Auto-Generate.");
+        instructionsInput.setAttribute("aria-invalid", "true");
         instructionsInput.focus();
         return;
       }
@@ -1174,9 +1138,8 @@ interface Segment {
       autoGenerating = true;
       uploadNewBtn.disabled = true;
       autoGenerateBtn.disabled = true;
-      autoGenerateBtn.style.opacity = "0.5";
-      autoGenerateBtn.style.cursor = "not-allowed";
       autoGenerateBtn.textContent = "Starting...";
+      if (!exporting) activity.status("Auto-generation", "Starting…");
 
       try {
         const response = await fetch("/api/auto-generate", {
@@ -1191,11 +1154,13 @@ interface Segment {
         const result = await response.json();
 
         if (!response.ok || result.status !== "ok" || !result.task_id) {
-          alert(`Error: ${result.message || "Failed to start auto-generation"}`);
+          activity.error("Auto-generation", result.message || "Failed to start auto-generation", "Check AI Settings or wait for processing, then retry Generate.");
           return;
         }
 
+        if (autoDownloadRow.contains(document.activeElement)) document.getElementById("activityToggle")!.focus();
         autoDownloadRow.classList.remove("visible");
+        activity.status("Auto-generation", "Processing…");
         // Poll the task: AI scoring can take a minute or two
         const deadline = Date.now() + 15 * 60 * 1000;
         while (Date.now() < deadline) {
@@ -1207,27 +1172,31 @@ interface Segment {
             autoDownloadLink.href = status.output_file;
             autoDownloadLink.target = "_blank";
             autoDownloadRow.classList.add("visible");
-            autoDownloadLink.textContent = `✅ Download (${status.highlights_used} clips, ${status.file_size_mb} MB)`;
+            autoDownloadLink.textContent = `Download Auto-Generated Reel (${status.highlights_used} clips, ${status.file_size_mb} MB)`;
 
             const filterMsg = ` (score >= ${selection.min_score})`;
-            alert(`Ready! ${status.highlights_used} of ${status.total_available} highlights${filterMsg}.`);
+            activity.clearError("Auto-generation");
+            activity.finish("Auto-generation", `Ready! ${status.highlights_used} of ${status.total_available} highlights${filterMsg}.`);
+            activity.results();
             return;
           }
           if (status.status === "error") {
-            alert(`Error: ${status.message}`);
+            activity.error("Auto-generation", status.message || "Generation failed.", "Check AI Settings and retry Generate.");
             return;
           }
           autoGenerateBtn.textContent = status.message || "Working...";
+          activity.status("Auto-generation", status.message || "Working…", status.progress);
         }
-        alert("Timed out waiting for the highlight reel. Check the app logs.");
+        activity.error("Auto-generation", "Timed out waiting for the highlight reel.", "Check the app logs before retrying Generate.");
       } catch (err) {
         console.error(err);
-        alert("Failed to auto-generate highlight reel");
+        activity.error("Auto-generation", "Failed to auto-generate highlight reel.", "Check the backend connection and retry Generate.");
       } finally {
         autoGenerating = false;
         uploadNewBtn.disabled = exporting;
         setAutoGenerateEnabled(llmAvailable);
-        autoGenerateBtn.textContent = "✨ Auto-Generate Highlight Reel";
+        autoGenerateBtn.textContent = "Auto-Generate Highlight Reel";
+        activity.finish("Auto-generation", "Ready to retry");
       }
     });
   
@@ -1246,15 +1215,17 @@ interface Segment {
           });
           const result = await response.json();
           if (!response.ok || result.status !== "ok") {
-            alert(`Error: ${result.message || "Failed to discard reel"}`);
+            activity.error("Discard", result.message || "Failed to discard reel", "Wait for processing, then retry Discard.");
             return;
           }
         }
+        if (autoDownloadRow.contains(document.activeElement)) document.getElementById("activityToggle")!.focus();
         autoDownloadRow.classList.remove("visible");
         autoDownloadLink.removeAttribute("href");
+        activity.clearError("Discard");
       } catch (err) {
         console.error("Failed to delete reel on server:", err);
-        alert("Failed to discard reel");
+        activity.error("Discard", "Failed to discard reel.", "Check the backend connection and retry Discard.");
       } finally {
         discardAutoBtn.disabled = false;
       }
@@ -1266,9 +1237,8 @@ interface Segment {
       uploadNewBtn.disabled = true;
       const payload = { selected_ids: Array.from(selectedIds) };
       exportBtn.disabled = true;
-      exportBtn.style.opacity = "0.5";
-      exportBtn.style.cursor = "not-allowed";
       exportBtn.textContent = "Generating...";
+      if (!autoGenerating) activity.status("Manual export", "Generating highlight reel…");
       try {
         const response = await fetch("/api/export", {
           method: "POST",
@@ -1280,18 +1250,22 @@ interface Segment {
           downloadLink.href = result.output_file;
           downloadLink.target = "_blank";
           downloadLink.classList.add("visible");
-          downloadLink.textContent = "✅ Download Highlight Reel";
+          downloadLink.textContent = "Download Reel from Selected Clips";
+          activity.clearError("Manual export");
+          activity.finish("Manual export", "Highlight reel ready");
+          activity.results();
         } else {
-          alert(`Error: ${result.message}`);
+          activity.error("Manual export", result.message || "Export failed.", "Wait for processing, then retry Create Reel from Selected Clips.");
         }
       } catch (err) {
         console.error(err);
-        alert("Failed to send selected segments");
+        activity.error("Manual export", "Failed to send selected segments.", "Check the backend connection and retry Create Reel from Selected Clips.");
       } finally {
         exporting = false;
         uploadNewBtn.disabled = autoGenerating;
         updateStats();
-        exportBtn.textContent = "Create Highlight Reel";
+        exportBtn.textContent = "Create Reel from Selected Clips";
+        activity.finish("Manual export", "Ready to retry");
       }
     });
   }
