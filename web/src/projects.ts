@@ -103,9 +103,16 @@ export class Projects {
 
   private async checkpointRequest(path: string, options: RequestInit = {}) {
     if (!this.active) throw new Error('Open a project first.');
+    const active = this.active;
     const response = await fetch(this.prefix + '/checkpoints' + path, { cache: 'no-store', ...options });
     const result = await response.json();
-    if (!response.ok) throw new Error(record(result) && typeof result.message === 'string' ? result.message : `Checkpoint request failed (HTTP ${response.status}).`);
+    if (!response.ok) {
+      const message = record(result) && typeof result.message === 'string' ? result.message : `Checkpoint request failed (HTTP ${response.status}).`;
+      if (response.status === 409 && record(result) && result.conflict === true && this.active === active) {
+        this.conflict = true; this.error = message; this.status = 'Project changed in another window'; this.onChange();
+      }
+      throw new Error(message);
+    }
     return result;
   }
 
@@ -130,9 +137,10 @@ export class Projects {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ revision: active?.revision })
     });
-    const restored = readProject(result.project);
+    const restored = readProject(record(result) ? result.project : null);
     if (restored.id !== active?.id) throw new Error('The server returned a different project.');
-    if (this.active !== active || this.changed !== version) {
+    if (this.active !== active) throw new Error('The checkpoint was restored in the previous project. Your currently open project is unchanged.');
+    if (this.changed !== version) {
       this.conflict = true;
       this.error = 'The checkpoint was restored on disk, but newer changes in this window were kept. Reload the saved version to use the restored checkpoint.';
       this.status = 'Changes not saved';

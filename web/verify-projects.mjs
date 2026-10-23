@@ -39,7 +39,7 @@ function fixture() {
       if (!options.method) return json({ checkpoints: list.map(summary) });
       if (options.method === 'DELETE') { const index = list.findIndex(item => item.id === checkpointId); if (index < 0) return json({}, 404); list.splice(index, 1); return json({ status: 'deleted' }); }
       const body = JSON.parse(options.body);
-      if (body.revision !== store[id].revision) return json({ message: 'Project changed in another window.' }, 409);
+      if (body.revision !== store[id].revision) return json({ message: 'Project changed in another window.', conflict: true }, 409);
       if (restore) {
         const item = list.find(item => item.id === checkpointId);
         if (!item) return json({}, 404);
@@ -172,4 +172,28 @@ await test('failed saves block checkpoint writes and stale restore responses pre
   assert.equal(project.conflict, true);
   await project.open('first', true);
   assert.deepEqual(project.active.state.selected_ids, [0]);
+});
+await test('checkpoint revision conflicts offer reload but a busy worker does not create a false conflict', async () => {
+  const { project, store } = fixture();
+  await project.discover(); store.first.revision++;
+  await assert.rejects(project.checkpoint('Stale'), /another window/);
+  assert.equal(project.conflict, true);
+  await project.open('first', true);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (url, options) => url.endsWith('/checkpoints') && options.method === 'POST'
+    ? Promise.resolve(new Response(JSON.stringify({ message: 'Workspace busy' }), { status: 409 })) : originalFetch(url, options);
+  await assert.rejects(project.checkpoint('Busy'), /Workspace busy/);
+  assert.equal(project.conflict, false);
+});
+await test('late checkpoint restore after navigation never replaces or blocks the newly opened project', async () => {
+  const { project, controls } = fixture();
+  await project.discover(); const saved = await project.checkpoint('First');
+  let release; controls.restoreHold = new Promise(resolve => { release = resolve; });
+  const restoring = project.restoreCheckpoint(saved.id);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  await project.open('second'); release();
+  await assert.rejects(restoring, /previous project/);
+  assert.equal(project.active.id, 'second');
+  assert.equal(project.conflict, false);
+  assert.deepEqual(project.active.state.selected_ids, [9]);
 });

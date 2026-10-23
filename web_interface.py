@@ -1776,7 +1776,7 @@ def project_checkpoints(project_id, checkpoint_id=None):
             return jsonify(projects.restore_checkpoint(project_id, checkpoint_id, data.get('revision')))
         return jsonify(projects.create_checkpoint(project_id, data.get('revision'), data.get('name'))), 201
     except ProjectConflict as error:
-        return jsonify(status='error', message=str(error)), 409
+        return jsonify(status='error', message=str(error), conflict=True), 409
     except FileNotFoundError as error:
         return jsonify(status='error', message=str(error)), 404
     except (ValueError, OSError) as error:
