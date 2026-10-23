@@ -139,7 +139,7 @@ def get_llm_settings() -> Dict:
 # ---------------------------------------------------------------------------
 
 # Bump this when the scoring prompt/response semantics intentionally change.
-SCORING_PROMPT_VERSION = "1"
+SCORING_PROMPT_VERSION = "2-batched"
 
 
 def _append_endpoint_path(base_url: str, path: str) -> str:
@@ -851,6 +851,119 @@ def load_transcription_json(file_path: str) -> Tuple[List[Dict], str]:
         return [], ""
 
 
+def _scoring_batches(segments, max_segments, max_chars):
+    """Bound transcript text without dropping a long passage or changing its id."""
+    if type(max_segments) is not int or max_segments < 1:
+        raise ValueError("Maximum batch segments must be a positive integer.")
+    if type(max_chars) is not int or max_chars < 64:
+        raise ValueError("Maximum batch characters must be an integer of at least 64.")
+    transcript_digest(segments)  # Validate identities, text, and finite timings first.
+    identities = [canonical_segment_id(s["id"]) for s in segments]
+    if len(set(identities)) != len(identities):
+        raise ScoringError("Transcript ids are ambiguous; import the recording again.", category="parse")
+    batches, batch, lines, size, seen = [], [], [], 0, set()
+    for segment in segments:
+        sid = canonical_segment_id(segment["id"])
+        if (any(type(segment[key]) not in (int, float) for key in ("start", "end"))
+                or segment["start"] < 0 or segment["end"] <= segment["start"]):
+            raise ScoringError("Transcript timing is invalid; import the recording again.", category="parse")
+        header = f"ID:{segment['id']} [{segment['start']:.2f}s-{segment['end']:.2f}s] "
+        budget = max_chars - len(header)
+        if budget < 1:
+            raise ScoringError("A transcript identifier exceeds the scoring batch size.", category="parse")
+        remaining = segment["text"].strip()
+        fragments = []
+        if not remaining:
+            fragments.append("")
+        while remaining:
+            cut = min(len(remaining), budget)
+            if cut < len(remaining):
+                # Keep words whole when possible; a single oversized word must split.
+                boundary = remaining.rfind(" ", 0, cut + 1)
+                if boundary > 0:
+                    cut = boundary
+            fragments.append(remaining[:cut].strip())
+            remaining = remaining[cut:].lstrip()
+        for fragment in fragments:
+            line = header + fragment if fragment else ""
+            extra = len(line) + (1 if lines and line else 0)
+            if batch and (len(batch) >= max_segments or size + extra > max_chars or sid in seen):
+                batches.append((batch, "\n".join(lines)))
+                batch, lines, size, seen = [], [], 0, set()
+                extra = len(line)
+            batch.append({**segment, "text": fragment})
+            seen.add(sid)
+            if line:
+                lines.append(line)
+            size += extra
+    if batch:
+        batches.append((batch, "\n".join(lines)))
+    return batches
+
+
+def score_in_batches(backend, segments, instructions, max_segments=80, max_chars=16000):
+    """Score the entire recording using bounded provider requests.
+
+    Limits apply to transcript characters, not the instructions/prompt envelope.
+    Each batch is independently validated against its exact source identities.
+    In a multi-batch run a parse failure permits useful, explicitly partial
+    results; authentication, rate-limit and transport failures stop immediately.
+    A segment split into text fragments is admitted only if every fragment was
+    scored, then receives its highest fragment score. This preserves honest
+    segment coverage and the existing complete-only automatic cache contract.
+    """
+    instructions = (instructions or "").strip()
+    if not instructions:
+        raise ScoringError("Highlight instructions are required.", category="config")
+    batches = _scoring_batches(segments, max_segments, max_chars)
+    combined, diagnostics, failed, incomplete = [], [], [], set()
+    for index, (batch, transcript) in enumerate(batches):
+        if len(batches) > 1:
+            print(f"Scoring batch {index + 1}/{len(batches)} ({len(batch)} passages)...")
+        try:
+            returned = backend.score(batch, transcript, instructions)
+            validated = enrich_results(returned, batch)
+            # Built-in providers already rejected malformed raw records. Preserve
+            # their diagnostics rather than counting only the normalized result.
+            prior = returned.validation if isinstance(returned, ScoringResult) else None
+            diagnostics.append((index, prior or validated.validation))
+            scored_ids = {canonical_segment_id(r["segment_id"]) for r in validated}
+            incomplete.update(canonical_segment_id(s["id"]) for s in batch
+                              if canonical_segment_id(s["id"]) not in scored_ids)
+            combined.extend(validated)
+        except ScoringError as error:
+            if len(batches) == 1 or error.category != "parse":
+                raise
+            incomplete.update(canonical_segment_id(s["id"]) for s in batch)
+            failed.append({"batch_index": index, "category": error.category})
+            if error.diagnostics:
+                diagnostics.append((index, error.diagnostics))
+            print(f"Batch {index + 1} had no usable scores; continuing with remaining passages.")
+    # Do not use one successful fragment to conceal an unscored part of a passage.
+    combined = [record for record in combined
+                if canonical_segment_id(record["segment_id"]) not in incomplete]
+    result = enrich_results(combined, segments)
+    validation = result.validation
+    rejection_counts, examples = {}, []
+    for batch_index, detail in diagnostics:
+        for key, count in detail.get("rejection_counts", {}).items():
+            rejection_counts[key] = rejection_counts.get(key, 0) + count
+        for example in detail.get("rejection_examples", []):
+            if len(examples) < 10:
+                examples.append({**example, **({"batch_index": batch_index} if len(batches) > 1 else {})})
+    validation["rejection_counts"] = rejection_counts
+    validation["rejected_records"] = sum(rejection_counts.values())
+    validation["rejection_examples"] = examples
+    validation["duplicate_records"] += sum(d.get("duplicate_records", 0) for _, d in diagnostics)
+    validation["batch_count"] = len(batches)
+    validation["completed_batches"] = len(batches) - len(failed)
+    validation["failed_batch_count"] = len(failed)
+    validation["failed_batches"] = failed[:10]
+    validation["fragment_count"] = sum(len(batch) for batch, _ in batches)
+    report_validation(result)
+    return result
+
+
 def run_scoring(transcript_path: str, output_dir: str, instructions: str) -> bool:
     """
     Score a transcription's segments with the configured backend and write
@@ -876,13 +989,7 @@ def run_scoring(transcript_path: str, output_dir: str, instructions: str) -> boo
         backend = get_backend()
         identity = score_cache_identity(segments, instructions, backend)
         print(f"Using scoring backend: {backend.name}")
-        highlights = backend.score(segments, transcript, instructions)
-        # Existing custom backends may return a plain enriched list. They still
-        # need to use enrich_results before internal consumption; guard their
-        # returned records here as well before statistics or persistence.
-        if not isinstance(highlights, ScoringResult):
-            highlights = enrich_results(highlights, segments)
-            report_validation(highlights)
+        highlights = score_in_batches(backend, segments, instructions)
     except ScoringError as e:
         print(f"ERROR: {e}")
         if e.diagnostics:
