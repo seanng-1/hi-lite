@@ -1755,6 +1755,37 @@ def project_detail(project_id):
         return jsonify(status='error', message=str(error)), 400
 
 
+@app.route('/api/projects/<project_id>/checkpoints', methods=['GET', 'POST'])
+@app.route('/api/projects/<project_id>/checkpoints/<checkpoint_id>', methods=['DELETE'])
+@app.route('/api/projects/<project_id>/checkpoints/<checkpoint_id>/restore', methods=['POST'])
+def project_checkpoints(project_id, checkpoint_id=None):
+    owner = None
+    try:
+        if request.method == 'GET':
+            return jsonify(checkpoints=projects.list_checkpoints(project_id))
+        owner = acquire_workspace()
+        if owner is None:
+            return workspace_busy()
+        if request.method == 'DELETE':
+            projects.delete_checkpoint(project_id, checkpoint_id)
+            return jsonify(status='deleted')
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            raise ValueError('Request body must be a JSON object.')
+        if checkpoint_id:
+            return jsonify(projects.restore_checkpoint(project_id, checkpoint_id, data.get('revision')))
+        return jsonify(projects.create_checkpoint(project_id, data.get('revision'), data.get('name'))), 201
+    except ProjectConflict as error:
+        return jsonify(status='error', message=str(error)), 409
+    except FileNotFoundError as error:
+        return jsonify(status='error', message=str(error)), 404
+    except (ValueError, OSError) as error:
+        return jsonify(status='error', message=str(error)), 400
+    finally:
+        if owner is not None:
+            release_workspace(owner)
+
+
 def project_route(view):
     @wraps(view)
     def scoped(project_id, **kwargs):

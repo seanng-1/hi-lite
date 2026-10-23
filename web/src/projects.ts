@@ -11,6 +11,12 @@ export interface Project extends ProjectSummary {
   revision: number;
   state: Record<string, unknown>;
 }
+export interface Checkpoint { id: string; name: string; created_at: string; project_revision: number; }
+function readCheckpoint(value: unknown): Checkpoint {
+  if (!record(value) || typeof value.id !== 'string' || !/^[a-f0-9]{32}$/.test(value.id) ||
+      typeof value.name !== 'string' || typeof value.created_at !== 'string' || !Number.isSafeInteger(value.project_revision)) throw new Error('The checkpoint could not be read.');
+  return value as unknown as Checkpoint;
+}
 const activeKey = 'hi-lite.active-project';
 const record = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -93,6 +99,54 @@ export class Projects {
     await this.open(result.id);
     this.recent = [result, ...this.recent.filter(project => project.id !== result.id)];
     this.onChange();
+  }
+
+  private async checkpointRequest(path: string, options: RequestInit = {}) {
+    if (!this.active) throw new Error('Open a project first.');
+    const response = await fetch(this.prefix + '/checkpoints' + path, { cache: 'no-store', ...options });
+    const result = await response.json();
+    if (!response.ok) throw new Error(record(result) && typeof result.message === 'string' ? result.message : `Checkpoint request failed (HTTP ${response.status}).`);
+    return result;
+  }
+
+  async checkpoints(): Promise<Checkpoint[]> {
+    const result = await this.checkpointRequest('');
+    if (!record(result) || !Array.isArray(result.checkpoints)) throw new Error('Checkpoints could not be loaded.');
+    return result.checkpoints.map(readCheckpoint);
+  }
+
+  async checkpoint(name: string): Promise<Checkpoint> {
+    await this.flush();
+    return readCheckpoint(await this.checkpointRequest('', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ revision: this.active?.revision, name })
+    }));
+  }
+
+  async restoreCheckpoint(id: string) {
+    await this.flush();
+    const active = this.active, version = this.changed;
+    const result = await this.checkpointRequest(`/${encodeURIComponent(id)}/restore`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ revision: active?.revision })
+    });
+    const restored = readProject(result.project);
+    if (restored.id !== active?.id) throw new Error('The server returned a different project.');
+    if (this.active !== active || this.changed !== version) {
+      this.conflict = true;
+      this.error = 'The checkpoint was restored on disk, but newer changes in this window were kept. Reload the saved version to use the restored checkpoint.';
+      this.status = 'Changes not saved';
+      this.onChange();
+      throw new Error(this.error);
+    }
+    this.active = restored;
+    this.changed = this.saved = 0;
+    this.error = ''; this.conflict = false; this.status = 'Checkpoint restored';
+    this.onChange();
+  }
+
+  async deleteCheckpoint(id: string) {
+    await this.checkpointRequest(`/${encodeURIComponent(id)}`, { method: 'DELETE' });
   }
 
   update(patch: Record<string, unknown>) {

@@ -28,6 +28,8 @@ w.HTMLDialogElement.prototype.close = function () { this.open = false; this.disp
 w.confirm = () => true;
 let saveFailure = 0;
 let uploads = 0;
+let checkpointSequence = 0;
+const checkpoints = [];
 w.fetch = async (input, options = {}) => {
  const path = String(input);
  const json = (value, status = 200) => new Response(JSON.stringify(value), { status });
@@ -43,6 +45,25 @@ w.fetch = async (input, options = {}) => {
  if (match) {
    const project = store[match[1]];
    if (!project) return json({}, 404);
+   if (match[2] === '/checkpoints') {
+     if (options.method === 'POST') {
+       const body = JSON.parse(options.body);
+       if (project.revision !== body.revision) return json({ message: 'Conflict' }, 409);
+       const item = { id: (++checkpointSequence).toString(16).padStart(32, '0'), name: body.name, project_revision: body.revision, created_at: '2026-10-23T12:00:00Z', state: structuredClone(project.state) };
+       checkpoints.push(item); return json(item, 201);
+     }
+     return json({ checkpoints });
+   }
+   const checkpoint = match[2].match(/^\/checkpoints\/([^/]+)(\/restore)?$/);
+   if (checkpoint) {
+     const index = checkpoints.findIndex(item => item.id === checkpoint[1]);
+     if (index < 0) return json({}, 404);
+     if (options.method === 'DELETE') { checkpoints.splice(index, 1); return json({ status: 'deleted' }); }
+     const body = JSON.parse(options.body);
+     if (project.revision !== body.revision) return json({ message: 'Conflict' }, 409);
+     project.state = structuredClone(checkpoints[index].state); project.revision++;
+     return json({ project });
+   }
    if (!match[2]) {
      if (options.method === 'PUT') {
        if (saveFailure) return json({}, saveFailure);
@@ -67,6 +88,32 @@ await until(() => $('#selectAll'));
 assert.deepEqual(selected(), [4]);
 assert.equal($('#aiInstructions').value, 'Saved criteria');
 assert.equal($('#mainVideo').getAttribute('src'), `/api/projects/${a}/api/source/${a}`);
+$('#checkpointsTrigger').click();
+await until(() => $('#checkpointList').textContent.includes('No checkpoints'));
+$('#checkpointName').value = 'Original <safe> cut';
+$('#checkpointForm').dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+await until(() => $('#checkpointStatus').textContent.includes('Checkpoint saved'));
+assert.equal(checkpoints.length, 1);
+assert.equal($('#checkpointList strong').textContent, 'Original <safe> cut');
+$('#closeCheckpoints').click();
+$('#selectAll').click();
+$('#checkpointsTrigger').click();
+await until(() => $('[data-restore-checkpoint]'));
+w.confirm = () => false; $('[data-restore-checkpoint]').click();
+assert.deepEqual(selected(), [0,4,9]);
+w.confirm = () => true;
+$('[data-restore-checkpoint]').click();
+await until(() => !$('#checkpointDialog') && $('#selectAll'));
+assert.deepEqual(selected(), [4]);
+$('#checkpointsTrigger').click();
+await until(() => $('[data-delete-checkpoint]'));
+w.confirm = () => false; $('[data-delete-checkpoint]').click();
+assert.equal(checkpoints.length, 1);
+w.confirm = () => true; $('[data-delete-checkpoint]').click();
+await until(() => $('#checkpointStatus').textContent.includes('Checkpoint deleted'));
+assert.equal(checkpoints.length, 0);
+assert.deepEqual(selected(), [4]);
+$('#closeCheckpoints').click();
 $('#selectAll').click();
 $('#projectsTrigger').click();
 await until(() => $(`[data-project-id="${b}"]`));
@@ -91,5 +138,5 @@ await until(() => $('#recordingContext').textContent === '<script>never execute<
 assert.equal(uploads, 0);
 assert.equal(store[a].has_media, true);
 assert.deepEqual(errors, []);
-console.log('DOM smoke passed: load, scoped source, selection restore, save-failure blocking, reopen, safe create, no media overwrite.');
+console.log('DOM smoke passed: load, scoped source, selection restore, checkpoint save/restore/delete/cancel, save-failure blocking, reopen, safe create, no media overwrite.');
 w.close();

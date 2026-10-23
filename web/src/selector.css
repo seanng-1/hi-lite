@@ -292,6 +292,10 @@ h2 { font-size: 14px; font-weight: 650; line-height: 1.4; }
 #recentProjects { display: grid; gap: 8px; }
 .recent-project { display: grid; gap: 4px; text-align: left; overflow-wrap: anywhere; }
 .recent-project span { color: var(--studio-muted); font-size: 12px; }
+#checkpointList { display: grid; gap: 10px; }
+.checkpoint-row { display: grid; grid-template-columns: 1fr auto auto; gap: 6px 10px; align-items: center; padding: 12px; border: 1px solid var(--studio-input-line); border-radius: 6px; }
+.checkpoint-row strong { grid-column: 1 / -1; overflow-wrap: anywhere; }
+.checkpoint-row span, #checkpointStatus { color: var(--studio-muted); font-size: 12px; }
 @media (max-width: 480px) {
   .shell-header:has(.header-actions) .project-navigation { grid-column: 1 / -1; grid-row: 3; }
 }

@@ -17,7 +17,9 @@ function fixture() {
     second: { id: 'second', name: 'Second', revision: 3, state: { selected_ids: [9] } },
   };
   const requests = [];
-  const controls = { fail: 0, hold: null };
+  const controls = { fail: 0, hold: null, restoreHold: null };
+  const checkpoints = new Map();
+  let sequence = 0;
   globalThis.fetch = async (url, options = {}) => {
     requests.push({ url, options });
     const json = (body, status = 200) => new Response(JSON.stringify(body), { status });
@@ -27,6 +29,26 @@ function fixture() {
         return json(store.third, 201);
       }
       return json({ projects: Object.values(store) });
+    }
+    const checkpointRoute = url.match(/^\/api\/projects\/([^/]+)\/checkpoints(?:\/([^/]+)(\/restore)?)?$/);
+    if (checkpointRoute) {
+      const [, id, checkpointId, restore] = checkpointRoute;
+      if (!store[id]) return json({}, 404);
+      const list = checkpoints.get(id) || []; checkpoints.set(id, list);
+      const summary = ({ state, ...item }) => item;
+      if (!options.method) return json({ checkpoints: list.map(summary) });
+      if (options.method === 'DELETE') { const index = list.findIndex(item => item.id === checkpointId); if (index < 0) return json({}, 404); list.splice(index, 1); return json({ status: 'deleted' }); }
+      const body = JSON.parse(options.body);
+      if (body.revision !== store[id].revision) return json({ message: 'Project changed in another window.' }, 409);
+      if (restore) {
+        const item = list.find(item => item.id === checkpointId);
+        if (!item) return json({}, 404);
+        if (controls.restoreHold) await controls.restoreHold;
+        store[id] = { ...store[id], revision: store[id].revision + 1, state: structuredClone(item.state) };
+        return json({ project: store[id] });
+      }
+      const item = { id: (++sequence).toString(16).padStart(32, '0'), name: body.name, created_at: '2026-10-23T12:00:00Z', project_revision: body.revision, state: structuredClone(store[id].state) };
+      list.push(item); return json(summary(item), 201);
     }
     const id = url.split('/').pop();
     if (!store[id]) return json({}, 404);
@@ -113,4 +135,41 @@ await test('missing project APIs retain legacy compatibility', async () => {
   assert.equal(project.url('/api/export'), '/api/export');
   globalThis.fetch = async () => new Response('<html>Static development server</html>');
   assert.equal(await project.discover(), false);
+});
+await test('named checkpoints flush edits, list summaries, restore and delete without changing other projects', async () => {
+  const { project, store } = fixture();
+  await project.discover();
+  project.update({ selected_ids: [9], edited_captions: [{ text: 'Final captions' }] });
+  const saved = await project.checkpoint('Final cut');
+  assert.equal(saved.name, 'Final cut');
+  assert.equal(saved.project_revision, 2);
+  assert.equal((await project.checkpoints())[0].id, saved.id);
+  project.update({ selected_ids: [] });
+  await project.restoreCheckpoint(saved.id);
+  assert.deepEqual(project.active.state.selected_ids, [9]);
+  assert.deepEqual(project.active.state.edited_captions, [{ text: 'Final captions' }]);
+  assert.equal(project.dirty, false);
+  assert.equal(project.status, 'Checkpoint restored');
+  await project.deleteCheckpoint(saved.id);
+  assert.deepEqual(await project.checkpoints(), []);
+  assert.deepEqual(store.second.state.selected_ids, [9]);
+});
+await test('failed saves block checkpoint writes and stale restore responses preserve newer local edits', async () => {
+  const { project, controls } = fixture();
+  await project.discover();
+  project.update({ selected_ids: [0] }); controls.fail = 503;
+  await assert.rejects(project.checkpoint('Not saved'), /Could not save/);
+  controls.fail = 0;
+  const saved = await project.checkpoint('Saved');
+  let release;
+  controls.restoreHold = new Promise(resolve => { release = resolve; });
+  const restoring = project.restoreCheckpoint(saved.id);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  project.update({ selected_ids: [9] });
+  release();
+  await assert.rejects(restoring, /newer changes/);
+  assert.deepEqual(project.active.state.selected_ids, [9]);
+  assert.equal(project.conflict, true);
+  await project.open('first', true);
+  assert.deepEqual(project.active.state.selected_ids, [0]);
 });

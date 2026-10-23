@@ -189,6 +189,7 @@ interface Segment {
   function setupProjectChrome() {
     if (!projects.enabled) return;
     document.getElementById('projectsTrigger')!.addEventListener('click', openProjectPicker);
+    document.getElementById('checkpointsTrigger')?.addEventListener('click', openCheckpoints);
     document.getElementById('projectSaveRetry')!.addEventListener('click', () => { void projects.flush().catch(() => {}); });
     document.getElementById('projectReload')!.addEventListener('click', () => {
       if (projects.active && confirm('Reload the saved project? Unsaved changes in this window will be discarded.')) {
@@ -200,6 +201,69 @@ interface Segment {
       document.getElementById('recordingContext')!.title = projects.active.name;
     }
     updateProjectChrome();
+  }
+
+  function openCheckpoints() {
+    if (!projects.active?.has_media || projectOperations.size || navigatingProject || document.getElementById('checkpointDialog')) return;
+    const dialog = document.createElement('dialog');
+    dialog.id = 'checkpointDialog'; dialog.className = 'project-dialog';
+    dialog.setAttribute('aria-labelledby', 'checkpointHeading');
+    dialog.innerHTML = `<div class="panel-heading"><h2 id="checkpointHeading">Edit checkpoints</h2><button id="closeCheckpoints">Close</button></div>
+      <div class="project-dialog-body"><p class="field-help">Save named versions of your selections, edits, captions and settings. Restoring first saves a recovery checkpoint. Original media and exports are not copied or deleted.</p>
+      <form id="checkpointForm"><label for="checkpointName">Checkpoint name</label><input id="checkpointName" type="text" maxlength="120" required placeholder="e.g. Before trying a shorter cut" autocomplete="off"><button class="primary" type="submit">Save checkpoint</button></form>
+      <div id="checkpointStatus" role="status"></div><div id="checkpointList"></div><p role="alert"></p></div>`;
+    let busy = false, requestVersion = 0;
+    const alert = dialog.querySelector<HTMLElement>('[role="alert"]')!;
+    const status = dialog.querySelector<HTMLElement>('#checkpointStatus')!;
+    async function refresh() {
+      const version = ++requestVersion;
+      const items = await projects.checkpoints();
+      if (!dialog.isConnected || version !== requestVersion) return;
+      const list = dialog.querySelector('#checkpointList')!; list.replaceChildren();
+      if (!items.length) list.textContent = 'No checkpoints yet. Save one before experimenting.';
+      for (const item of items) {
+        const row = document.createElement('div'); row.className = 'checkpoint-row';
+        const title = document.createElement('strong'); title.textContent = item.name;
+        const detail = document.createElement('span'); detail.textContent = `${new Date(item.created_at).toLocaleString()} · revision ${item.project_revision}`;
+        const restore = document.createElement('button'); restore.type = 'button'; restore.textContent = 'Restore'; restore.dataset.restoreCheckpoint = item.id;
+        restore.addEventListener('click', () => {
+          if (!busy && confirm(`Restore “${item.name}”? Your current saved edit will be kept as a recovery checkpoint.`)) void navigateProject(() => projects.restoreCheckpoint(item.id), dialog);
+        });
+        const remove = document.createElement('button'); remove.type = 'button'; remove.textContent = 'Delete'; remove.dataset.deleteCheckpoint = item.id;
+        remove.addEventListener('click', () => {
+          if (!busy && confirm(`Permanently delete checkpoint “${item.name}”? Your current edit and original media are unaffected.`)) void run(async () => { await projects.deleteCheckpoint(item.id); status.textContent = 'Checkpoint deleted. Current edit unchanged.'; });
+        });
+        row.append(title, detail, restore, remove); list.append(row);
+      }
+    }
+    async function run(action: () => Promise<void>) {
+      if (busy || navigatingProject || projectOperations.size) return;
+      busy = true; navigatingProject = true; alert.textContent = '';
+      const shell = document.querySelector<HTMLElement>('.editor-shell'); if (shell) shell.inert = true;
+      updateProjectChrome();
+      dialog.querySelectorAll<HTMLButtonElement | HTMLInputElement>('button,input').forEach(node => node.disabled = true);
+      try { await action(); await refresh(); }
+      catch (error) { alert.textContent = error instanceof Error ? error.message : 'Checkpoint could not be saved.'; }
+      finally {
+        busy = false; navigatingProject = false;
+        if (shell) shell.inert = false;
+        dialog.querySelectorAll<HTMLButtonElement | HTMLInputElement>('button,input').forEach(node => node.disabled = false);
+        updateProjectChrome();
+      }
+    }
+    dialog.querySelector('#checkpointForm')!.addEventListener('submit', event => {
+      event.preventDefault();
+      const input = dialog.querySelector<HTMLInputElement>('#checkpointName')!;
+      const name = input.value.trim();
+      if (!name) { input.setCustomValidity('Enter a checkpoint name.'); input.reportValidity(); return; }
+      void run(async () => { await projects.checkpoint(name); input.value = ''; status.textContent = 'Checkpoint saved. You can keep experimenting.'; });
+    });
+    dialog.querySelector('#checkpointName')!.addEventListener('input', event => (event.target as HTMLInputElement).setCustomValidity(''));
+    dialog.querySelector('#closeCheckpoints')!.addEventListener('click', () => { if (!busy && !navigatingProject) dialog.close(); });
+    dialog.addEventListener('cancel', event => { if (busy || navigatingProject) event.preventDefault(); });
+    dialog.addEventListener('close', () => { requestVersion++; dialog.remove(); });
+    document.body.append(dialog); dialog.showModal();
+    void refresh().catch(error => { if (dialog.isConnected) alert.textContent = error.message; });
   }
 
   window.addEventListener('beforeunload', event => {
@@ -214,7 +278,7 @@ interface Segment {
       ${review ? '<a class="skip-link" href="#transcriptHeading">Skip to transcript</a>' : ''}
       <header class="shell-header">
         <h1 class="shell-brand"><img class="brand-logo" src="${logoUrl}" alt="" width="32" height="32">Hi-Lite</h1>
-        ${projects.enabled ? '<div class="project-navigation"><button id="projectsTrigger">Projects</button><span id="projectSaveStatus" role="status"></span><button id="projectSaveRetry" hidden>Retry save</button><button id="projectReload" hidden>Reload saved version</button></div>' : ''}
+        ${projects.enabled ? `<div class="project-navigation"><button id="projectsTrigger">Projects</button>${projects.active?.has_media ? '<button id="checkpointsTrigger" data-project-operation>Checkpoints</button>' : ''}<span id="projectSaveStatus" role="status"></span><button id="projectSaveRetry" hidden>Retry save</button><button id="projectReload" hidden>Reload saved version</button></div>` : ''}
         <span class="recording-context" id="recordingContext">${review ? 'Current recording' : 'Import a recording'}</span>
         ${review ? `<div class="header-actions">
           <button class="drawer-trigger" id="mediaTrigger" aria-controls="mediaPanel" aria-expanded="false">Media</button>

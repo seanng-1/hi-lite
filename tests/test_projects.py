@@ -57,6 +57,63 @@ class Projects(unittest.TestCase):
         self.assertEqual(self.store.get(project['id'])['revision'], 0)
         self.assertEqual(self.store.get(project['id'])['state']['selected_ids'], [])
 
+    def test_checkpoints_restore_exact_state_and_preserve_recovery(self):
+        project = self.store.create('Recording')
+        paths = self.store.paths(project['id'])
+        Path(paths['SEGMENTS_JSON']).write_text('{"segments": []}')
+        original = {'selected_ids': [2], 'edit_document': {'ranges': []}, 'edited_captions': [{'text': 'Original'}], 'export_settings': {'aspect_ratio': '9:16'}}
+        self.store.save(project['id'], 0, original)
+        checkpoint = self.store.create_checkpoint(project['id'], 1, 'First cut')
+        changed = {'selected_ids': [7], 'edited_captions': [{'text': 'Changed'}]}
+        self.store.save(project['id'], 1, changed)
+        result = ProjectStore(self.root).restore_checkpoint(project['id'], checkpoint['id'], 2)
+        self.assertEqual(result['project']['state'], original)
+        self.assertEqual(result['project']['revision'], 3)
+        self.assertEqual(result['project']['name'], 'Recording')
+        recovery = result['recovery_checkpoint']
+        self.assertEqual(len(self.store.list_checkpoints(project['id'])), 2)
+        self.assertNotIn('state', checkpoint)
+        self.assertEqual(self.store.restore_checkpoint(project['id'], recovery['id'], 3)['project']['state'], changed)
+        self.store.delete_checkpoint(project['id'], checkpoint['id'])
+        self.assertEqual(self.store.get(project['id'])['state'], changed)
+
+    def test_checkpoint_revision_source_identity_limits_and_no_media_mutation(self):
+        one = self.store.create('One'); two = self.store.create('Two')
+        with self.assertRaisesRegex(ValueError, 'Import a recording'):
+            self.store.create_checkpoint(one['id'], 0, 'Not ready')
+        manifest = Path(self.store.paths(one['id'])['SEGMENTS_JSON'])
+        manifest.write_text('{"segments": []}')
+        before = manifest.stat()
+        checkpoint = self.store.create_checkpoint(one['id'], 0, 'First')
+        self.assertEqual(self.store.get(one['id'])['revision'], 0)
+        for revision in (-1, 1, True, None):
+            with self.assertRaises(ProjectConflict): self.store.create_checkpoint(one['id'], revision, 'Invalid')
+            with self.assertRaises(ProjectConflict): self.store.restore_checkpoint(one['id'], checkpoint['id'], revision)
+        with self.assertRaises(FileNotFoundError): self.store.restore_checkpoint(two['id'], checkpoint['id'], 0)
+        with self.assertRaises(ValueError): self.store.delete_checkpoint(one['id'], '../outside')
+        with patch('project_store.MAX_CHECKPOINTS', 1):
+            with self.assertRaisesRegex(ValueError, 'unused checkpoint'): self.store.create_checkpoint(one['id'], 0, 'Limit')
+            with self.assertRaisesRegex(ValueError, 'unused checkpoint'): self.store.restore_checkpoint(one['id'], checkpoint['id'], 0)
+        self.assertEqual(before.st_ino, manifest.stat().st_ino)
+        manifest.write_text('{"segments": [1]}')
+        with self.assertRaisesRegex(ValueError, 'recording or transcript changed'):
+            self.store.restore_checkpoint(one['id'], checkpoint['id'], 0)
+        self.assertEqual(self.store.get(one['id'])['revision'], 0)
+
+    def test_checkpoint_atomic_failure_corrupt_listing_and_symlink_defense(self):
+        project = self.store.create()
+        Path(self.store.paths(project['id'])['SEGMENTS_JSON']).write_text('{}')
+        checkpoint = self.store.create_checkpoint(project['id'], 0, 'Valid')
+        folder = self.store.directory(project['id']) / 'checkpoints'
+        (folder / ('d' * 32 + '.json')).write_text('{')
+        self.assertEqual(len(self.store.list_checkpoints(project['id'])), 1)
+        with patch('project_store._atomic_write', side_effect=OSError('disk full')):
+            with self.assertRaises(OSError): self.store.restore_checkpoint(project['id'], checkpoint['id'], 0)
+        self.assertEqual(self.store.get(project['id'])['revision'], 0)
+        other = self.store.create('Symlink')
+        (self.store.directory(other['id']) / 'checkpoints').symlink_to(folder, target_is_directory=True)
+        with self.assertRaises(ValueError): self.store.list_checkpoints(other['id'])
+
 
 class ProjectAPI(unittest.TestCase):
     def setUp(self):
@@ -158,6 +215,33 @@ class ProjectAPI(unittest.TestCase):
         for value in ([], 123, 'text', None):
             self.assertEqual(self.client.post('/api/projects', json=value).status_code, 400)
             self.assertEqual(self.client.put(self.url(self.one), json=value).status_code, 400)
+
+    def test_checkpoint_api_scope_recovery_and_admission(self):
+        paths, _ = self.seed(self.one)
+        original = Path(paths['SEGMENTS_JSON']).read_bytes()
+        url = self.url(self.one, '/checkpoints')
+        created = self.client.post(url, json={'revision': 0, 'name': 'First cut'})
+        self.assertEqual(created.status_code, 201)
+        checkpoint = created.json
+        self.assertEqual(self.client.get(url).json['checkpoints'][0]['id'], checkpoint['id'])
+        self.assertNotIn('state', checkpoint)
+        self.client.put(self.url(self.one), json={'revision': 0, 'state': {'selected_ids': [0]}})
+        self.assertEqual(self.client.post(url + '/' + checkpoint['id'] + '/restore', json={'revision': 0}).status_code, 409)
+        restored = self.client.post(url + '/' + checkpoint['id'] + '/restore', json={'revision': 1})
+        self.assertEqual(restored.status_code, 200)
+        self.assertEqual(restored.json['project']['state']['selected_ids'], [])
+        self.assertEqual(Path(paths['SEGMENTS_JSON']).read_bytes(), original)
+        self.assertEqual(self.client.delete(self.url(self.two, '/checkpoints/' + checkpoint['id'])).status_code, 404)
+        owner = self.backend.acquire_workspace()
+        try:
+            self.assertEqual(self.client.post(url, json={'revision': 2, 'name': 'Busy'}).status_code, 409)
+            self.assertEqual(self.client.delete(url + '/' + checkpoint['id']).status_code, 409)
+            self.assertEqual(self.client.get(url).status_code, 200)
+        finally: self.backend.release_workspace(owner)
+        self.assertEqual(self.client.delete(url + '/' + checkpoint['id']).status_code, 200)
+        for payload in (None, [], 'bad', {'revision': 2, 'name': ''}):
+            self.assertEqual(self.client.post(url, json=payload).status_code, 400)
+        self.assertIsNone(self.backend._workspace_owner)
 
 
 if __name__ == '__main__': unittest.main()
