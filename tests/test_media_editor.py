@@ -16,6 +16,52 @@ import media_editor as editor
 
 
 class EditingContracts(unittest.TestCase):
+    def test_large_contiguous_document_coalesces_without_mutation(self):
+        ranges = [{"start": index, "end": index + 1} for index in range(10000)]
+        original = copy.deepcopy(ranges)
+        self.assertEqual(editor.coalesce_source_ranges(ranges),
+                         [{"start": 0, "end": 10000, "crop": {"x": .5, "y": .5}}])
+        self.assertEqual(ranges, original)
+        self.assertEqual(len(editor.validate_source_ranges(ranges * 10)), 100000)
+        with self.assertRaisesRegex(ValueError, "100000"):
+            editor.validate_source_ranges(ranges * 10 + ranges[:1])
+
+    def test_coalescing_respects_order_gaps_repeats_and_effective_crop(self):
+        ranges = [{"start": 2, "end": 3}, {"start": 3, "end": 4, "crop": {"x": .2}},
+                  {"start": 4, "end": 5, "crop": {"x": .8}}, {"start": 6, "end": 7},
+                  {"start": 0, "end": 1}, {"start": 0, "end": 1},
+                  {"start": 1.00000001, "end": 2}]
+        result = editor.coalesce_source_ranges(ranges, {"x": .2})
+        self.assertEqual([(r["start"], r["end"]) for r in result],
+                         [(2, 4), (4, 5), (6, 7), (0, 1), (0, 1), (1.00000001, 2)])
+        self.assertEqual(result[0]["crop"], {"x": .2, "y": .5})
+
+    def test_captions_continue_through_adjacent_ranges_even_across_crop_change(self):
+        cues = [{"start": 0, "end": 4, "text": "continuous"}]
+        cuts = [{"start": 0, "end": 1}, {"start": 1, "end": 2, "crop": {"x": 0}},
+                {"start": 3, "end": 4}, {"start": 0, "end": 1}]
+        self.assertEqual(editor.remap_captions(cues, cuts),
+                         [{"start": 0, "end": 2, "text": "continuous"},
+                          {"start": 2, "end": 3, "text": "continuous"},
+                          {"start": 3, "end": 4, "text": "continuous"}])
+
+    def test_large_caption_index_preserves_nested_overlaps_and_reordering(self):
+        cues = [{"start": index, "end": index + .5, "text": str(index)} for index in range(10000)]
+        cues.insert(0, {"start": 0, "end": 10000, "text": "overlap"})
+        cuts = [{"start": index, "end": index + .5} for index in range(9999, -1, -1)]
+        result = editor.remap_captions(cues, cuts)
+        self.assertEqual(len(result), 20000)
+        self.assertEqual([cue["text"] for cue in result[:4]], ["overlap", "9999", "overlap", "9998"])
+        self.assertEqual(result[-1], {"start": 4999.5, "end": 5000, "text": "0"})
+
+    def test_caption_repeat_expansion_is_bounded(self):
+        cues = [{"start": 0, "end": 1, "text": "repeated"}]
+        cuts = [{"start": 0, "end": 1}] * 3
+        with patch.object(editor, "MAX_REMAPPED_CAPTIONS", 2), self.assertRaisesRegex(ValueError, "smaller groups"):
+            editor.remap_captions(cues, cuts)
+        with patch.object(editor, "MAX_REMAPPED_TEXT", 10), self.assertRaisesRegex(ValueError, "smaller groups"):
+            editor.remap_captions(cues, cuts)
+
     def test_pipeline_defaults_to_metadata_and_legacy_render_is_explicit(self):
         import main as pipeline
         transcript = {"segments": [{"id": "one", "start": 0, "end": 1, "text": "Hello"}]}
@@ -51,7 +97,7 @@ class EditingContracts(unittest.TestCase):
         cuts = [{"start": 5, "end": 6}, {"start": 2, "end": 5}, {"start": 5, "end": 6}]
         original = copy.deepcopy(cues)
         expected = [{"start": 0, "end": 1, "text": "second"}, {"start": 1, "end": 3, "text": "first"},
-                    {"start": 3, "end": 4, "text": "second"}, {"start": 4, "end": 5, "text": "second"}]
+                    {"start": 3, "end": 5, "text": "second"}]
         self.assertEqual(editor.remap_captions(cues, cuts), expected)
         self.assertEqual(cues, original)
         self.assertIn("00:00:01,000 --> 00:00:03,000\nfirst", editor.export_subtitles(cues, cuts))
@@ -116,6 +162,25 @@ class EditingContracts(unittest.TestCase):
 
 
 class ProcessLifecycle(unittest.TestCase):
+    def test_export_renders_10000_contiguous_ranges_only_once(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source, output = Path(folder, "source.mp4"), Path(folder, "out.mp4")
+            source.write_bytes(b"source")
+            info = {"duration": 10000, "width": 160, "height": 90, "fps": 10, "has_audio": False}
+
+            def render(command, **kwargs):
+                target = Path(kwargs.get("cwd", folder)) / command[-1]
+                target.write_bytes(b"finished")
+
+            with patch.object(editor, "probe_source", return_value=info), \
+                 patch.object(editor, "_run_process", side_effect=render) as process:
+                result = editor.export_source_ranges(source,
+                    [{"start": index, "end": index + 1} for index in range(10000)], output,
+                    captions=[{"start": 0, "end": 10000, "text": "one continuous cue"}])
+            self.assertEqual(process.call_count, 2)  # one source render plus final mux
+            self.assertEqual(result["duration"], 10000)
+            self.assertEqual(result["subtitles"]["srt"].count("one continuous cue"), 1)
+
     def test_cancellation_reaps_process(self):
         event = threading.Event()
         process = []

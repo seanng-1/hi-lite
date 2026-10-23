@@ -21,6 +21,7 @@ path, dimensions, duration, and SRT/VTT strings (not public download URLs).
 import json
 import math
 import os
+from bisect import bisect_left
 from pathlib import Path
 import re
 import signal
@@ -33,6 +34,10 @@ from subtitle_serializer import NoCaptions, serialize_subtitles
 FFMPEG = os.getenv("FFMPEG_PATH", "ffmpeg")
 FFPROBE = os.getenv("FFPROBE_PATH", "ffprobe")
 ASPECT_RATIOS = {"original": None, "9:16": (9, 16), "16:9": (16, 9), "1:1": (1, 1)}
+MAX_SOURCE_RANGES = 100000
+MAX_SOURCE_CAPTIONS = 50000
+MAX_REMAPPED_CAPTIONS = 250000
+MAX_REMAPPED_TEXT = 16 * 1024 * 1024
 
 
 class ExportCancelled(RuntimeError):
@@ -62,8 +67,8 @@ def _crop(value):
 
 def validate_source_ranges(ranges, duration=None):
     """Return normalized ranges, rejecting bad timings rather than guessing."""
-    if not isinstance(ranges, list) or not ranges or len(ranges) > 1000:
-        raise ValueError("Choose between 1 and 1000 source ranges.")
+    if not isinstance(ranges, list) or not ranges or len(ranges) > MAX_SOURCE_RANGES:
+        raise ValueError(f"Choose between 1 and {MAX_SOURCE_RANGES} source ranges.")
     if duration is not None:
         duration = _number(duration, "Source duration", 0.001)
     result = []
@@ -78,10 +83,29 @@ def validate_source_ranges(ranges, duration=None):
     return result
 
 
+def coalesce_source_ranges(ranges, default_crop=None):
+    """Collapse exactly contiguous, identically framed ranges in O(range count).
+
+    No sorting, tolerance or gap filling is used. Repeats, backwards jumps and
+    crop changes remain separate render operations. Missing crop values use the
+    export's default crop, so an explicit equivalent default also coalesces.
+    The caller's logical edit document is never changed.
+    """
+    fallback = _crop(default_crop)
+    result = []
+    for item in validate_source_ranges(ranges):
+        current = {**item, "crop": item.get("crop", fallback).copy()}
+        if result and result[-1]["end"] == current["start"] and result[-1]["crop"] == current["crop"]:
+            result[-1]["end"] = current["end"]
+        else:
+            result.append(current)
+    return result
+
+
 def validate_captions(captions, duration=None):
     """Validate editable source-time cues; empty text intentionally hides a cue."""
-    if not isinstance(captions, list) or len(captions) > 50000:
-        raise ValueError("Captions must be a list of at most 50000 cues.")
+    if not isinstance(captions, list) or len(captions) > MAX_SOURCE_CAPTIONS:
+        raise ValueError(f"Captions must be a list of at most {MAX_SOURCE_CAPTIONS} cues.")
     result = []
     for index, cue in enumerate(captions):
         if not isinstance(cue, dict):
@@ -129,16 +153,52 @@ def validate_export_settings(settings=None):
 
 
 def remap_captions(captions, ranges):
-    """Clip cues at each cut and shift them to ordered reel time, without mutation."""
-    cues = validate_captions(captions)
+    """Clip/shift cues to reel time without splitting at continuous source seams.
+
+    An interval index avoids a full transcript scan for each of up to 100000
+    logical cuts. Repeated footage legitimately duplicates cues, but expansion
+    is bounded to 250000 output cues and 16 Mi characters of output cue text.
+    """
+    cues = [cue for cue in validate_captions(captions) if cue["text"]]
     selected = validate_source_ranges(ranges)
-    result, offset = [], 0.0
+    # Framing does not change the caption timeline. Adjacent source time is
+    # continuous even when two video ranges need distinct crop settings.
+    selected = coalesce_source_ranges([{"start": item["start"], "end": item["end"]} for item in selected])
+    if not cues:
+        return []
+    starts = [cue["start"] for cue in cues]
+    # A max-end interval tree handles overlapping/nested cues as well as the
+    # usual disjoint transcript. Traversal preserves equal-start input order.
+    size = 1 << (len(cues) - 1).bit_length()
+    max_ends = [0.0] * (2 * size)
+    max_ends[size:size + len(cues)] = [cue["end"] for cue in cues]
+    for node in range(size - 1, 0, -1):
+        max_ends[node] = max(max_ends[node * 2], max_ends[node * 2 + 1])
+
+    def overlaps(start, end):
+        last = bisect_left(starts, end)
+        stack = [(1, 0, size)]
+        while stack:
+            node, left, right = stack.pop()
+            if left >= last or max_ends[node] <= start:
+                continue
+            if right - left == 1:
+                yield cues[left]
+            else:
+                middle = (left + right) // 2
+                stack.append((node * 2 + 1, middle, right))
+                stack.append((node * 2, left, middle))
+
+    result, offset, text_size = [], 0.0, 0
     for selected_range in selected:
         start, end = selected_range["start"], selected_range["end"]
-        for cue in cues:
+        for cue in overlaps(start, end):
             left, right = max(start, cue["start"]), min(end, cue["end"])
             # Tiny clipped slivers cannot be represented by millisecond subtitles.
-            if right - left >= 0.001 and cue["text"]:
+            if right - left >= 0.001:
+                text_size += len(cue["text"])
+                if len(result) >= MAX_REMAPPED_CAPTIONS or text_size > MAX_REMAPPED_TEXT:
+                    raise ValueError("Selected repeats produce too many captions; export smaller groups.")
                 result.append({"start": round(offset + left - start, 9),
                                "end": round(offset + right - start, 9), "text": cue["text"]})
         offset += end - start
@@ -308,6 +368,9 @@ def export_source_ranges(source_path, ranges, output_path, *, captions=None, set
     _check_cancel(cancel_event)
     info = probe_source(source, cancel_event=cancel_event)
     selected = validate_source_ranges(selected, info["duration"])
+    # Render physical continuity once, not once per transcript sentence. Work
+    # stays sequential (one ffmpeg process at a time), even for gapped reels.
+    selected = coalesce_source_ranges(selected, options["crop"])
     source_captions = validate_captions(source_captions, info["duration"])
     cues = remap_captions(source_captions, selected)
     geometry = crop_geometry(info["width"], info["height"], options["aspect_ratio"], options["crop"])
