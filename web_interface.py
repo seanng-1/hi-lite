@@ -531,7 +531,7 @@ def process_video_async(video_path, output_folder, task_id):
                         "status": "processing",
                         "stage": "extracting_segments",
                         "progress": 70,
-                        "message": "Extracting video segments..."
+                        "message": "Preparing source ranges (no segment rendering)..."
                     }
                 elif "Step 5: Creating segment manifest" in line:
                     processing_status[task_id] = {

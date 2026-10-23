@@ -145,8 +145,11 @@ def register_editor_api(app, backend):
                     b['processing_status'][task] = dict(status='processing', stage='rendering', progress=int(index / len(groups) * 95),
                                                        message=f'Rendering {index + 1} of {len(groups)}...')
                     created.append(Path(p['HIGHLIGHTS_DIR']) / name)
+                    def progress(percent):
+                        b['processing_status'][task].update(progress=min(99, int((index + percent / 100) / len(groups) * 100)))
                     result = export_source_ranges(source, selected, Path(p['HIGHLIGHTS_DIR']) / name,
-                                                  captions=captions, settings=settings, cancel_event=b['_cancel_events'][task])
+                                                  captions=captions, settings=settings, cancel_event=b['_cancel_events'][task],
+                                                  progress_callback=progress)
                     outputs.append(dict(output_file=f'/final/{name}', duration=result['duration']))
                 if b['_cancel_events'][task].is_set():
                     raise RuntimeError('Export cancelled.')
