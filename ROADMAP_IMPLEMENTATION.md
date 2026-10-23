@@ -19,6 +19,28 @@ Implementation is kept on local branch `feature/roadmap-local`; nothing has been
 | M5.5: cancellation (optional) | Cancel import, scoring/candidate and editor rendering jobs; poll until terminal; subprocess-tree cleanup; no new operation before admission releases | Job/API/process tests, cancellation UI regressions |
 | M6: cleanup | Reviewable pause-shortening and aligned filler-word suggestions; explicit acceptance; undo | Cleanup model tests and DOM acceptance/undo tests |
 
+## Additional workflow improvements
+
+Added after the initial issue implementation at `8e172c2`:
+
+- Full-source transcript search with literal phrase highlighting, match counts,
+  Previous/Next navigation and paused source seeking.
+- Editor-scoped keyboard playback, seek, search, range removal and undo/redo,
+  with visible shortcut help and input/busy-state safeguards.
+- Undoable Shorts, Landscape and Square export/caption presets. Settings remain
+  adjustable; selecting a preset never starts an export.
+- Named project checkpoints, persisted separately from the current state.
+  Restore automatically saves a recovery checkpoint and verifies the project
+  revision and recording/transcript identity. Explicit deletion affects only the
+  chosen checkpoint. Up to 50 checkpoints per project; no automatic pruning.
+- A reproducible synthetic gameplay demo that renders real edited, captioned and
+  reframed videos and extracts unaltered frames for feature documentation.
+
+The original base already included source-timeline preview and original-transcript
+SRT/VTT downloads. The issue implementation added non-destructive editable sequence
+exports and subtitles remapped through those edits, rather than inventing preview
+or subtitle support from scratch.
+
 ## Architecture and compatibility
 
 - Existing recordings are adopted in place, not copied or moved. Existing source/transcript validity markers are preserved.

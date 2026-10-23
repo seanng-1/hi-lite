@@ -76,6 +76,30 @@ The original source is still required for source preview and new exports. Keep
 project folders and linked originals backed up together. Do not manually edit the
 project metadata or replace an original with different footage.
 
+### Faster editing and safe experiments
+
+- **Search transcript** finds a literal word or phrase across the full source,
+  including passages removed from the edit. Match counts, highlights, and
+  Previous/Next navigation help you locate a moment and seek its paused preview.
+- **Keyboard shortcuts** are listed in the editor: Space/K plays or pauses,
+  J/L seeks five seconds, `/` or Ctrl/Command+F opens transcript search,
+  Delete removes selected sequence ranges, and Ctrl/Command+Z undoes.
+  Typing in input fields keeps normal text-editing behavior; shortcuts stop while
+  an operation is busy. Expand the help for the complete list.
+- **Export presets** apply ready-to-tweak Shorts, Landscape or Square framing
+  and caption settings. They do not export automatically. Review the crop before
+  rendering; Undo restores the previous settings.
+- **Checkpoints** save named versions of a project's selections, edits, captions,
+  candidates and settings. Restore first saves an automatic recovery checkpoint,
+  so trying another cut does not discard the current one. Restore requires the
+  same recording/transcript and a current project revision. Checkpoints do not
+  duplicate media or exports and are not a substitute for a full project backup.
+  Each project supports 50 checkpoints; delete an unused one explicitly if full.
+
+For reproducible frames of **actual exported output**, see
+[`demos/README.md`](demos/README.md). The demo creates clearly labeled synthetic
+arcade footage and runs it through the production cut/crop/caption exporter.
+
 ## What leaves your machine
 
 | What you do | What goes over the network |
