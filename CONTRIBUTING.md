@@ -11,11 +11,25 @@ Windows-packaging landmines that have each caused a real release failure.
    built frontend, upload/status/export APIs, and clip files.
 3. **Pipeline child** — on upload, the server re-invokes *its own executable* as
    `backend.exe --process-video ...` (in dev: `python main.py`). Pipeline:
-   extract audio → transcribe (faster-whisper, word timestamps) → cut one mp4 per
-   segment (ffmpeg) → write `segments_manifest.json`.
+   extract audio → transcribe (faster-whisper, word timestamps) → create buffered
+   source-range metadata → write `segments_manifest.json`. No per-segment render
+   is required; `--render-segments` preserves the old CLI behavior.
 
-The frontend (`web/src/selector.ts`) reads only the root manifest
-`/data/segments_manifest.json`; a new upload replaces previous results.
+The frontend (`web/src/selector.ts`, `projects.ts`, `transcript-editor.ts`) uses
+`/api/projects/<id>` for revision-checked project state and prefixes existing
+media/API paths with that project scope. `project_store.py` publishes atomic
+JSON with compare-and-swap revisions; `editor_api.py` validates edits and launches
+jobs. Existing unscoped routes retain the original single-workspace layout.
+Legacy adoption references that layout without copying/moving source files.
+Never mutate module-level workspace paths: request ContextVars and explicitly
+inherited worker context are what isolate projects.
+
+`edit_model.py` owns immutable source-time edit snapshots and reviewable suggestions.
+`media_editor.py` is the shared source-range renderer for manual, AI and editor
+exports. It validates cut order/timing, crops, remaps captions and stages outputs
+atomically; cancellation must reap the subprocess before releasing admission.
+`desktop_sources.py` permits external-file linking only through the token-protected
+Electron main-process native picker, never renderer-supplied arbitrary paths.
 
 **Auto-Generate** POSTs `/api/auto-generate`; the server runs the LLM scorer
 (`model_based_processing/scoring.py`) as a subprocess, then stitches clips whose score
@@ -175,8 +189,11 @@ to another backend.
   `python -m unittest discover -s tests -v`; scoring provider calls are stubbed.
   Run `python tests/smoke_score_cache.py` for real scoring-subprocess and ffmpeg
   coverage of scoring, reuse, transcript invalidation, and threshold-only reuse.
-  Run the built UI checks with `cd web && npm test`; install Chromium or set
-  `CHROME_BIN` to its executable. These checks use no additional test dependencies.
+  Run project-state checks with `cd web && npm run test:projects`, deterministic
+  DOM/API checks with `npm run test:dom` (uses the test-only jsdom dependency),
+  and the full built UI browser suite with `npm test`; install Chromium or set
+  `CHROME_BIN` to its executable. The Chromium suite uses no browser automation test dependency. DOM tests stub
+  media/layout and do not replace real browser playback or visual checks.
   Packaging changes also need the Windows `verify-app-flow.py` run.
 - Keep pipeline prints ASCII; don't break the status-parser strings.
 - Contributions are accepted under the project license (GPL-3.0-or-later).

@@ -3,9 +3,9 @@
 Turn long gameplay, podcasts or sports videos into a highlight reel. No account, no sign-up,
 and your video files never leave your computer.
 
-Hi-Lite transcribes your video's commentary on-device (faster-whisper), cuts one clip
-per spoken segment, lets you pick the good ones in a web UI, and exports a stitched
-highlight reel. There is also an optional **Auto-Generate** feature that has an LLM score
+Hi-Lite transcribes your video's commentary on-device (faster-whisper), saves it in
+a persistent project, and lets you edit transcript passages without changing the
+original recording. Source ranges are rendered only when you export. There is also an optional **Auto-Generate** feature that has an LLM score
 the clips for you, using a backend *you* choose: a model running on your own machine
 (fully offline), or an OpenAI-compatible API with your own key. See
 [What leaves your machine](#what-leaves-your-machine).
@@ -22,15 +22,59 @@ Whisper model (~500 MB) downloads automatically.
 ## How it works
 
 1. **Upload** a video — audio is extracted and transcribed locally with word-level timestamps
-2. **Review** — one clip per transcript segment, previewed in the browser
+2. **Review** — transcript passages previewed directly from the original recording
    <img width="1909" height="943" alt="Clip selection" src="https://github.com/user-attachments/assets/366961f6-7b86-49f6-8ba5-76ceb036768d" />
 3. **Select** clips manually — fully offline — or hit **Auto-Generate** to have an LLM
    score every segment against your own criteria ("clutch rounds and funny moments
    only"). Scoring runs on a local model or your own API account; see
    [Auto-Generate setup](#auto-generate-setup)
    <img width="1914" height="947" alt="Auto-generate" src="https://github.com/user-attachments/assets/9022393a-3fa0-4346-a47a-f9ce59609478" />
-4. **Export** — clips are stitched into a single mp4 you can download
+4. **Edit and export** — open the transcript editor to trim, split, combine or reorder
+   passages; undo/redo; edit captions; review cleanup and clip suggestions; then
+   export a reel or individual clips in original, 9:16, 16:9 or 1:1 framing
    <img width="1911" height="945" alt="Export" src="https://github.com/user-attachments/assets/981f5132-50ee-49eb-a5fe-800cbf3921d0" />
+
+## Persistent projects and transcript editing
+
+- **Projects** creates named recordings and opens recent work without retranscription.
+  Selections, transcript edits, caption text and export settings autosave locally.
+  Save conflicts do not overwrite changes from another window; retry failed saves
+  or explicitly reopen the saved version. Closing with unsaved changes warns you.
+- Each project has its own source, transcript, manifests and exports under
+  `HI_LITE_DATA_DIR/projects/<id>/`. An existing single-workspace recording appears
+  as **Previous recording** and is adopted in place, without moving media.
+- New imports create metadata, not thousands of intermediate video files. Older
+  clip-based workspaces remain readable. Command-line users can opt into eager
+  segment rendering with `python main.py video.mp4 --render-segments`.
+- **Open transcript editor** edits source-time ranges. Cuts never modify the source.
+  Split/trim/combine/reorder, caption edits and accepted cleanup suggestions support
+  undo/redo while the editor is open. Saved edits survive reopening the app.
+- Captions can be edited, styled, burned into video, or downloaded as SRT/VTT after
+  remapping through cuts. Crop controls set horizontal/vertical framing; individual
+  exports follow the edited clip groups.
+- Candidate generation lets you request a count, target length and category.
+  Offline suggestions are explicitly labeled **local heuristics**, not AI.
+  Opting into AI uses only your configured provider and scores the complete
+  transcript in bounded batches. Every result remains reviewable before replacing
+  your edit. The app may return fewer candidates when distinct passages are limited.
+- Cleanup proposes silence shortening and aligned filler-word cuts. Nothing is
+  removed until you accept a suggestion. Review transitions before exporting.
+- Background transcription, scoring and editor rendering can be cancelled. The
+  worker is stopped before another operation is admitted; incomplete exports are
+  removed rather than offered as finished files.
+- The Electron desktop app can **link an original** using its native picker instead
+  of copying the video. Keep it unchanged; **Relink original** can locate an unchanged
+  moved copy using content verification, without retranscribing. Browser uploads
+  continue to use managed copies.
+
+Source preview depends on the codecs supported by the browser; use H.264/AAC
+MP4 for the broadest compatibility. FFmpeg export can still read supported source
+formats that the browser cannot play. Rendering uses temporary media, including
+lossless audio, so allow free disk space for the selected footage.
+
+The original source is still required for source preview and new exports. Keep
+project folders and linked originals backed up together. Do not manually edit the
+project metadata or replace an original with different footage.
 
 ## What leaves your machine
 
@@ -98,7 +142,7 @@ Windows packaging.
 | `WHISPER_MODEL` | `small` | Whisper model size (`tiny` for quick tests) |
 | `HI_LITE_PRE_BUFFER` / `HI_LITE_POST_BUFFER` | `0.5` / `0.75` | Seconds of padding around each clip |
 | `HI_LITE_PORT` | `8000` | Backend port |
-| `HI_LITE_DATA_DIR` | repo root | Where uploads, clips, and models live |
+| `HI_LITE_DATA_DIR` | repo root | Where projects, uploads, exports, and models live |
 | `HI_LITE_LLM_BACKEND` | auto | Force the Auto-Generate backend: `local` or `api` |
 | `HI_LITE_LLM_BASE_URL` / `HI_LITE_LLM_API_KEY` / `HI_LITE_LLM_MODEL` | OpenAI / — / `gpt-4o-mini` | API backend settings (also editable in-app) |
 | `HI_LITE_LLM_LOCAL_URL` / `HI_LITE_LLM_LOCAL_MODEL` | `http://127.0.0.1:11434` / `qwen2.5:7b-instruct` | Local backend settings |
