@@ -7,6 +7,8 @@ import sys
 import json
 from transcript_store import invalidate_transcript, publish_transcript
 from datetime import datetime
+from pathlib import Path
+from uuid import uuid4
 
 # Windows consoles/pipes default to cp1252, which cannot encode transcript
 # text and would kill the process with UnicodeEncodeError. Force UTF-8.
@@ -18,7 +20,7 @@ from transcription_client import transcribe_audio
 from highlight_analyzer import export_segments_to_excel, save_segment_manifest, find_highlights_from_segments
 
 
-def main(video_input_path, output_folder="highlights", final_output_name="highlight_reel.mp4", *, render_segments=False):
+def main(video_input_path, output_folder="highlights", final_output_name="highlight_reel.mp4", *, render_segments=False, publish_original=False):
     """
     Main processing function for video highlights.
     """
@@ -87,6 +89,19 @@ def main(video_input_path, output_folder="highlights", final_output_name="highli
     print("Step 5: Creating segment manifest...")
     save_segment_manifest(segment_files, output_folder)
     print()
+
+    # Standalone CLI imports must also retain a validated source reference now
+    # that clips are not rendered eagerly. Server imports defer publication to
+    # the admitted parent, which owns the task/source identity.
+    if publish_original:
+        from source_preview import SOURCE_LOCK, prepare_external_source, publish_source
+        with SOURCE_LOCK:
+            source_id = uuid4().hex
+            original = Path(video_input_path).resolve()
+            uploads = Path(output_folder).resolve().parent / 'uploads'
+            if original.parent != uploads:
+                prepare_external_source(output_folder, str(original), source_id)
+            publish_source(output_folder, uploads, original, source_id)
 
     # Summary
     #TODO: Edit the last few steps here. This main function now handles all the initial processing
@@ -159,6 +174,8 @@ if __name__ == "__main__":
     parser.add_argument("--video-path", help="Video path for creating reel (if different)")
     parser.add_argument("--render-segments", action="store_true", help="Legacy mode: eagerly render every segment")
     
+    parser.add_argument("--defer-source-publication", action="store_true", help=argparse.SUPPRESS)
+
     args = parser.parse_args()
     
     if args.create_reel:
@@ -177,4 +194,5 @@ if __name__ == "__main__":
             print("Please provide a valid video file path.")
             exit(1)
         
-        main(args.video, args.output, render_segments=args.render_segments)
+        main(args.video, args.output, render_segments=args.render_segments,
+             publish_original=not args.defer_source_publication)

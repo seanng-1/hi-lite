@@ -12,6 +12,7 @@ llm_config.json
 
 # Generated data (pipeline outputs, uploads, models)
 highlights/
+/projects/
 whisper_models/
 uploads/*
 !uploads/.gitkeep

@@ -48,7 +48,7 @@ def main():
             segments = [{'id': sid, 'start': i * 3 + 1, 'end': i * 3 + 2,
                          'text': 'An amazing goal!'} for i, sid in enumerate(IDS)]
             with patch.object(pipeline, 'transcribe_audio', return_value={'segments': segments}):
-                pipeline.main(str(source), web.MANIFEST_DIR)
+                pipeline.main(str(source), web.MANIFEST_DIR, publish_original=True)
             client = web.app.test_client()
             clips = client.get('/data/segments_manifest.json').json['segments']
             assert [c['id'] for c in clips] == [0, 1, 2], clips
@@ -93,7 +93,7 @@ def main():
                     assert result['highlights_used'] == count, result
                     assert [s['segment_id'] for s in result['segments_included']] == IDS[:count]
                     metadata = json.loads(max(Path(web.SEGMENTS_DIR).glob(
-                        'auto_highlights_metadata_*.json')).read_text())
+                        'auto_highlights_metadata_*.json'), key=lambda path: path.stat().st_mtime_ns).read_text())
                     assert [s['segment_id'] for s in metadata['segments']] == IDS[:count]
                     preview = client.post('/api/preview-auto-export', json={
                         'instructions': 'great plays', 'min_score': threshold})

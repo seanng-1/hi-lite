@@ -32,8 +32,8 @@ def validate_state(state):
         encoded = json.dumps(state, allow_nan=False, ensure_ascii=False).encode('utf-8')
     except (TypeError, ValueError):
         raise ValueError('Project state must contain finite JSON values.') from None
-    if len(encoded) > 2 * 1024 * 1024:
-        raise ValueError('Project state exceeds the 2 MB limit.')
+    if len(encoded) > 16 * 1024 * 1024:
+        raise ValueError('Project state exceeds the 16 MB limit.')
     ids = state.get('selected_ids', [])
     if (not isinstance(ids, list) or any(type(v) is not int or v < 0 for v in ids)
             or len(set(ids)) != len(ids)):

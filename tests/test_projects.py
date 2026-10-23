@@ -128,4 +128,36 @@ class ProjectAPI(unittest.TestCase):
         self.assertIsNone(self.backend._current_project.get())
 
 
+    def test_saved_jobs_survive_restart_and_interrupted_import_can_retry(self):
+        b = self.backend
+        token = b._current_project.set(self.one['id'])
+        self.addCleanup(lambda: b._current_project.reset(token))
+        paths = b.workspace_paths()
+        task = 'task_' + 'c' * 32
+        b.processing_status[task] = {'status': 'processing', 'message': 'Working'}
+        b.persist_job(task)
+        Path(paths['SEGMENTS_JSON']).write_text('{"segments": []}')
+        self.assertFalse(b.can_import_recording(), 'active imports must not be replaced')
+        b._server_instance = 'new-server-instance'
+        self.assertTrue(b.can_import_recording(), 'interrupted incomplete imports can be retried')
+        b.processing_status.clear()
+        result = self.client.get(self.url(self.one, '/api/processing-status/' + task))
+        self.assertEqual(result.json['status'], 'error')
+        self.assertIn('app stopped', result.json['message'])
+        self.assertEqual(self.client.get(self.url(self.two, '/api/processing-status/' + task)).status_code, 404)
+        Path(paths['MANIFEST_DIR'], 'current-source.json').write_text('{}')
+        self.assertFalse(b.can_import_recording(), 'published originals remain protected even if moved')
+        b.processing_status[task] = {'status': 'complete', 'output_file': '/final/finished.mp4'}
+        b.persist_job(task)
+        b.processing_status.clear()
+        result = self.client.get(self.url(self.one, '/api/processing-status/' + task))
+        self.assertEqual(result.json['status'], 'complete')
+        self.assertEqual(result.json['output_file'], self.url(self.one, '/final/finished.mp4'))
+
+    def test_non_object_project_payloads_are_rejected(self):
+        for value in ([], 123, 'text', None):
+            self.assertEqual(self.client.post('/api/projects', json=value).status_code, 400)
+            self.assertEqual(self.client.put(self.url(self.one), json=value).status_code, 400)
+
+
 if __name__ == '__main__': unittest.main()
