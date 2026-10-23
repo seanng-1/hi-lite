@@ -1,6 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import "./selector.css";
+import { Projects } from "./projects";
+import { mountTranscriptEditor } from "./transcript-editor";
 import { formatSourceTime as formatTime, readSource, setupSourceTimeline, timelineMarkup, type SourceReference } from './source-timeline';
+
+interface DesktopSourceResult {
+  status: 'ok' | 'cancelled' | 'error';
+  task_id?: string;
+  message?: string;
+}
+declare global {
+  interface Window {
+    hiLiteDesktop?: {
+      linkProject(projectId: string): Promise<DesktopSourceResult>;
+      relinkProject(projectId: string): Promise<DesktopSourceResult>;
+    };
+  }
+}
 
 const logoUrl = new URL("./assets/Hi-Lite-Logo.png", import.meta.url).href;
 
@@ -64,12 +80,141 @@ interface Segment {
   }
 
   let disposeShell = () => {};
+  const projects = new Projects();
+  const projectOperations = new Set<string>();
+  let navigatingProject = false;
+  let projectNavigationError = "";
+
+  function projectBusy(operation: string, busy: boolean) {
+    if (busy) projectOperations.add(operation); else projectOperations.delete(operation);
+    updateProjectChrome();
+  }
+
+  function updateProjectChrome() {
+    const status = document.getElementById('projectSaveStatus');
+    if (status) {
+      status.textContent = projects.active ? projects.status : 'No project open';
+      status.title = projects.error;
+      status.classList.toggle('save-error', !!projects.error);
+    }
+    const retry = document.getElementById('projectSaveRetry') as HTMLButtonElement | null;
+    if (retry) retry.hidden = !projects.error || projects.conflict;
+    const reload = document.getElementById('projectReload') as HTMLButtonElement | null;
+    if (reload) reload.hidden = !projects.conflict;
+    const trigger = document.getElementById('projectsTrigger') as HTMLButtonElement | null;
+    if (trigger) trigger.disabled = navigatingProject || projectOperations.size > 0;
+    document.querySelectorAll<HTMLButtonElement>('[data-project-operation]').forEach(button => button.disabled = navigatingProject || projectOperations.size > 0);
+    const error = document.getElementById('projectSaveError');
+    if (error) { error.textContent = projects.error || projectNavigationError; error.hidden = !error.textContent; }
+  }
+  projects.onChange = updateProjectChrome;
+
+  async function navigateProject(action: () => Promise<void>, dialog?: HTMLDialogElement) {
+    if (navigatingProject || projectOperations.size) return;
+    navigatingProject = true;
+    projectNavigationError = "";
+    const previousShell = document.querySelector<HTMLElement>('.editor-shell');
+    if (previousShell) previousShell.inert = true;
+    updateProjectChrome();
+    dialog?.querySelectorAll<HTMLButtonElement>('button').forEach(button => button.disabled = true);
+    try {
+      await action();
+      dialog?.close();
+      dialog?.remove();
+      disposeShell();
+      document.querySelector<HTMLVideoElement>('#mainVideo')?.pause();
+      document.getElementById('app')!.replaceChildren();
+      await main();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not open the project.';
+      const target = dialog?.querySelector<HTMLElement>('[role="alert"]');
+      if (target) target.textContent = message;
+      else projectNavigationError = message;
+    } finally {
+      navigatingProject = false;
+      if (previousShell) previousShell.inert = false;
+      dialog?.querySelectorAll<HTMLButtonElement>('button').forEach(button => button.disabled = false);
+      updateProjectChrome();
+    }
+  }
+
+  function openProjectPicker() {
+    if (!projects.enabled || projectOperations.size || navigatingProject || document.getElementById('projectDialog')) return;
+    const dialog = document.createElement('dialog');
+    dialog.id = 'projectDialog';
+    dialog.className = 'project-dialog';
+    dialog.setAttribute('aria-labelledby', 'projectsHeading');
+    dialog.innerHTML = `<div class="panel-heading"><h2 id="projectsHeading">Projects</h2><button id="closeProjects" aria-label="Close projects">Close</button></div>
+      <div class="project-dialog-body"><form id="newProjectForm"><label for="newProjectName">New project name</label>
+        <input id="newProjectName" type="text" maxlength="120" required placeholder="e.g. Weekend highlights" autocomplete="off">
+        <button type="submit" class="primary">Create new project</button></form>
+        <p class="field-help">Each project keeps its own recording, transcript, selected clips, and scoring options. Your current project is saved before switching.</p>
+        <h3>Recent projects</h3><div id="recentProjects"></div><p role="alert"></p></div>`;
+    function renderRecent() {
+      const list = dialog.querySelector('#recentProjects')!;
+      list.replaceChildren();
+      if (!projects.recent.length) list.textContent = 'No saved projects yet.';
+      for (const project of projects.recent) {
+        const button = document.createElement('button');
+        button.className = 'recent-project';
+        button.dataset.projectId = project.id;
+        const title = document.createElement('strong');
+        title.textContent = project.name;
+        const detail = document.createElement('span');
+        detail.textContent = `${project.id === projects.active?.id ? 'Current project · ' : ''}${project.has_media ? 'Recording saved' : 'Ready to import'}`;
+        button.append(title, detail);
+        button.addEventListener('click', () => { void navigateProject(() => projects.open(project.id), dialog); });
+        list.append(button);
+      }
+    }
+    dialog.querySelector('#closeProjects')!.addEventListener('click', () => { dialog.close(); });
+    dialog.addEventListener('cancel', event => { if (navigatingProject) event.preventDefault(); });
+    dialog.addEventListener('close', () => dialog.remove());
+    dialog.querySelector('#newProjectForm')!.addEventListener('submit', event => {
+      event.preventDefault();
+      const input = dialog.querySelector<HTMLInputElement>('#newProjectName')!;
+      const name = input.value.trim();
+      if (!name) { input.setCustomValidity('Enter a project name.'); input.reportValidity(); return; }
+      void navigateProject(() => projects.create(name), dialog);
+    });
+    dialog.querySelector('#newProjectName')!.addEventListener('input', event => (event.target as HTMLInputElement).setCustomValidity(''));
+    document.body.append(dialog);
+    renderRecent();
+    dialog.showModal();
+    void projects.refresh().then(() => { if (dialog.isConnected) renderRecent(); }).catch(error => {
+      if (dialog.isConnected) dialog.querySelector('[role="alert"]')!.textContent = error.message;
+    });
+  }
+
+  function setupProjectChrome() {
+    if (!projects.enabled) return;
+    document.getElementById('projectsTrigger')!.addEventListener('click', openProjectPicker);
+    document.getElementById('projectSaveRetry')!.addEventListener('click', () => { void projects.flush().catch(() => {}); });
+    document.getElementById('projectReload')!.addEventListener('click', () => {
+      if (projects.active && confirm('Reload the saved project? Unsaved changes in this window will be discarded.')) {
+        void navigateProject(() => projects.open(projects.active!.id, true));
+      }
+    });
+    if (projects.active) {
+      document.getElementById('recordingContext')!.textContent = projects.active.name;
+      document.getElementById('recordingContext')!.title = projects.active.name;
+    }
+    updateProjectChrome();
+  }
+
+  window.addEventListener('beforeunload', event => {
+    if (projects.dirty) { event.preventDefault(); event.returnValue = ''; }
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') void projects.flush().catch(() => {});
+  });
 
   function shellMarkup(workspace: string, review = false) {
     return `<div class="editor-shell ${review ? 'review-shell main-container' : 'import-shell'}">
       ${review ? '<a class="skip-link" href="#transcriptHeading">Skip to transcript</a>' : ''}
       <header class="shell-header">
         <h1 class="shell-brand"><img class="brand-logo" src="${logoUrl}" alt="" width="32" height="32">Hi-Lite</h1>
+        ${projects.enabled ? '<div class="project-navigation"><button id="projectsTrigger">Projects</button><span id="projectSaveStatus" role="status"></span><button id="projectSaveRetry" hidden>Retry save</button><button id="projectReload" hidden>Reload saved version</button></div>' : ''}
         <span class="recording-context" id="recordingContext">${review ? 'Current recording' : 'Import a recording'}</span>
         ${review ? `<div class="header-actions">
           <button class="drawer-trigger" id="mediaTrigger" aria-controls="mediaPanel" aria-expanded="false">Media</button>
@@ -84,9 +229,11 @@ interface Segment {
       <footer class="activity-footer" aria-label="Activity">
         <div class="activity-summary"><strong>Activity</strong>
           <span id="statusMessage" role="status">${review ? 'Ready to review' : 'Choose a video file to begin'}</span>
+          <button id="activityCancel" hidden>Cancel task</button>
           <button id="activityToggle" aria-expanded="false" aria-controls="activityDetails" hidden>Details</button></div>
         <div class="progress-bar" id="progressBar" role="progressbar" aria-label="Operation progress" hidden><div class="progress-fill" id="progressFill"></div></div>
         <div id="activityErrorSummary" hidden></div>
+        ${projects.enabled ? '<p id="projectSaveError" class="project-save-error" role="alert" hidden></p>' : ''}
         <div id="activityDetails" hidden>
           <div id="activityErrors"></div>
           <div class="activity-results" id="activityResults">
@@ -109,6 +256,8 @@ interface Segment {
     const summary = document.getElementById("activityErrorSummary")!;
     const details = document.getElementById("activityDetails")!;
     const toggle = document.getElementById("activityToggle")!;
+    const cancel = document.getElementById('activityCancel') as HTMLButtonElement;
+    let task: { operation: string; url: string; requesting: boolean; requested: boolean } | null = null;
     function expand(open: boolean) {
       if (!open && details.contains(document.activeElement)) toggle.focus();
       details.hidden = !open;
@@ -129,11 +278,30 @@ interface Segment {
       });
       updateErrorSummary();
     }
-    return {
+    const activity = {
+      trackTask(operation: string, taskId: string) {
+        task = { operation, url: projects.url(`/api/cancel/${encodeURIComponent(taskId)}`), requesting: false, requested: false };
+        cancel.hidden = false;
+        cancel.disabled = false;
+        cancel.textContent = 'Cancel task';
+        cancel.setAttribute('aria-label', `Cancel ${operation.toLowerCase()}`);
+        clearError('Cancel task');
+      },
+      isCancelling(operation: string) { return task?.operation === operation && (task.requesting || task.requested); },
+      endTask(operation: string) {
+        if (task?.operation !== operation) return;
+        task = null;
+        if (document.activeElement === cancel) { status.tabIndex = -1; status.focus(); }
+        cancel.hidden = true;
+        cancel.disabled = false;
+        clearError('Cancel task');
+        clearError(`${operation} status`);
+      },
       status(operation: string, message: string, progress?: number) {
         status.dataset.operation = operation;
         // Progress ticks update the bar, not a second live announcement.
-        const text = `${operation}: ${message}`;
+        const pendingCancel = task?.operation === operation && (task.requesting || task.requested);
+        const text = `${operation}: ${pendingCancel ? 'Cancellation requested. Waiting for the worker to stop…' : message}`;
         if (status.textContent !== text) status.textContent = text;
         bar.hidden = false;
         bar.classList.add("visible");
@@ -176,6 +344,31 @@ interface Segment {
       clearError,
       results() { toggle.hidden = false; expand(true); }
     };
+    cancel.addEventListener('click', async () => {
+      const current = task;
+      if (!current || current.requesting || current.requested) return;
+      current.requesting = true;
+      cancel.disabled = true;
+      cancel.textContent = 'Cancelling…';
+      activity.status(current.operation, 'Requesting cancellation…');
+      try {
+        const response = await fetch(current.url, { method: 'POST' });
+        const result = await response.json();
+        if (task !== current) return;
+        if (!response.ok || result.status !== 'cancelling') throw new Error(result.message || 'Could not request cancellation.');
+        current.requested = true;
+        activity.clearError('Cancel task');
+      } catch (error) {
+        if (task !== current) return;
+        cancel.disabled = false;
+        cancel.textContent = 'Retry cancellation';
+        activity.error('Cancel task', error instanceof Error ? error.message : 'Could not request cancellation.', 'The task is still being monitored. Retry cancellation, or wait for it to finish.');
+      } finally {
+        current.requesting = false;
+        if (task === current) activity.status(current.operation, current.requested ? 'Cancelling…' : 'Still processing…');
+      }
+    });
+    return activity;
   }
 
   function setupShell() {
@@ -183,6 +376,7 @@ interface Segment {
     const controller = new AbortController();
     disposeShell = () => controller.abort();
     const activity = setupActivity();
+    setupProjectChrome();
     const root = document.querySelector<HTMLElement>(".editor-shell")!;
     const mediaNode = document.getElementById("mediaPanel");
     const contextNode = document.getElementById("contextPanel");
@@ -217,6 +411,7 @@ interface Segment {
       skip.inert = !!pane;
       results.inert = !!pane;
       activityToggle.inert = !!pane;
+      document.getElementById("activityCancel")!.inert = !!pane;
       document.querySelectorAll<HTMLElement>("#activityErrors button").forEach(button => button.inert = !!pane);
       media.inert = !!pane && pane !== media;
       context.inert = !!pane && pane !== context;
@@ -332,13 +527,17 @@ interface Segment {
       setupShell().activity.status("Recording", "Loading…");
     }
   
+    if (projects.enabled && !projects.active) {
+      showUploadInterface();
+      return;
+    }
     // Try to load segments
     let segments: Segment[];
     let source: SourceReference | null = null;
     let currentVideoId = "default";
   
     try {
-      const response = await fetch("/data/segments_manifest.json", { cache: "no-store" });
+      const response = await fetch(projects.url("/data/segments_manifest.json"), { cache: "no-store" });
       if (response.status === 404) {
         showUploadInterface();
         return;
@@ -346,7 +545,8 @@ interface Segment {
       if (!response.ok) throw new Error(`Could not load the recording manifest (HTTP ${response.status}).`);
       const manifest = await response.json();
       segments = readSegments(manifest);
-      source = readSource(manifest);
+      source = readSource(manifest, projects.prefix);
+      if (projects.active) projects.active.has_media = true;
     } catch (err) {
       const message = err instanceof Error && !(err instanceof SyntaxError)
         ? err.message : "The recording manifest could not be read. It may contain invalid JSON.";
@@ -382,7 +582,7 @@ interface Segment {
     async function refresh() {
       if (!panel.isConnected) return;
       try {
-        const response = await fetch("/api/subtitles", { cache: "no-store" });
+        const response = await fetch(projects.url("/api/subtitles"), { cache: "no-store" });
         const result = await response.json();
         if (!downloading) {
           const importing = (document.getElementById("uploadButton") as HTMLButtonElement | null)?.disabled;
@@ -400,7 +600,7 @@ interface Segment {
       buttons.forEach(button => button.disabled = true);
       try {
         const format = button.dataset.format!;
-        const response = await fetch(`/api/subtitles/${format}`, { cache: "no-store" });
+        const response = await fetch(projects.url(`/api/subtitles/${format}`), { cache: "no-store" });
         if (!response.ok) {
           const result = await response.json();
           throw new Error(result.message || "Subtitle download failed");
@@ -425,6 +625,34 @@ interface Segment {
       }
     }));
     void refresh();
+  }
+
+  function mountRelink(parent: HTMLElement, activity: ReturnType<typeof setupActivity>) {
+    if (!window.hiLiteDesktop || !projects.active?.has_media) return;
+    const button = document.createElement('button');
+    button.id = 'relinkSource';
+    button.dataset.projectOperation = 'relink';
+    button.textContent = 'Relink original file';
+    const help = document.createElement('p');
+    help.className = 'field-help';
+    help.textContent = 'If your linked recording moved, choose the same original file. Your transcript and edits stay intact.';
+    parent.append(button, help);
+    button.addEventListener('click', async () => {
+      if (projectOperations.size || !projects.active) return;
+      projectBusy('relink', true);
+      activity.status('Source', 'Choose the original recording…');
+      try {
+        await projects.flush();
+        const result = await window.hiLiteDesktop!.relinkProject(projects.active.id);
+        if (result.status === 'cancelled') { activity.finish('Source', 'Relinking cancelled'); return; }
+        if (result.status !== 'ok') throw new Error(result.message || 'Could not relink the original file.');
+        activity.finish('Source', 'Original recording relinked');
+        await main();
+      } catch (error) {
+        activity.finish('Source', 'Relinking not completed');
+        activity.error('Source', error instanceof Error ? error.message : 'Could not relink the original file.', 'Choose the same unmodified recording and try Relink original file again.');
+      } finally { projectBusy('relink', false); }
+    });
   }
 
   function showUploadInterface(errorMessage = "") {
@@ -454,15 +682,90 @@ interface Segment {
       activity.error("Recording", errorMessage, "Choose Video File to retry.");
     }
   
-    uploadButton.addEventListener("click", () => videoInput.click());
+    if (projects.enabled && projects.active?.has_media) {
+      uploadButton.textContent = 'New / Open Project';
+      uploadButton.addEventListener('click', openProjectPicker);
+      const retry = document.createElement('button');
+      retry.textContent = 'Retry loading recording';
+      retry.addEventListener('click', () => { void main(); });
+      uploadButton.after(retry);
+    } else uploadButton.addEventListener("click", () => videoInput.click());
     uploadButton.focus();
   
+    async function pollImport(taskId: string, recordingName?: string) {
+      activity.trackTask('Import', taskId);
+      activity.status('Import', 'Processing video…');
+      try {
+        while (app.contains(uploadButton)) {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          if (!app.contains(uploadButton)) return;
+          let status;
+          try {
+            const response = await fetch(projects.url(`/api/processing-status/${encodeURIComponent(taskId)}`));
+            if (!response.ok) throw new Error('Could not check video processing status.');
+            status = await response.json();
+            if (!isRecord(status) || typeof status.status !== 'string') throw new Error('Invalid video processing status. Please try again.');
+          } catch (error) {
+            if (!activity.isCancelling('Import')) throw error;
+            activity.error('Import status', 'Could not confirm that the worker has stopped.', 'Waiting for the backend connection before allowing another import.');
+            continue;
+          }
+          activity.clearError('Import status');
+          activity.status('Import', typeof status.message === 'string' ? status.message : 'Processing…', typeof status.progress === 'number' ? status.progress : undefined);
+          if (status.status === 'complete') {
+            activity.finish('Import', 'Complete! Loading segments…');
+            projectBusy('import', false);
+            await main(recordingName);
+            return;
+          }
+          if (status.status === 'cancelled') {
+            activity.clearError('Import');
+            activity.finish('Import', 'Cancelled. Choose a video to try again.');
+            return;
+          }
+          if (status.status === 'error') throw new Error(typeof status.message === 'string' ? status.message : 'Video processing failed.');
+          if (status.status !== 'processing' && status.status !== 'cancelling') {
+            if (activity.isCancelling('Import')) {
+              activity.error('Import status', 'The worker has not confirmed cancellation.', 'Waiting for a terminal task status before allowing another import.');
+              continue;
+            }
+            throw new Error('Invalid video processing status. Please try again.');
+          }
+        }
+      } finally { activity.endTask('Import'); }
+    }
+    if (projects.enabled && window.hiLiteDesktop && !projects.active?.has_media) {
+      const link = document.createElement('button');
+      link.id = 'linkSource';
+      link.dataset.projectOperation = 'import';
+      link.textContent = 'Link original file without copying';
+      uploadButton.after(link);
+      link.addEventListener('click', async () => {
+        if (projectOperations.size) return;
+        projectBusy('import', true);
+        uploadButton.disabled = true;
+        activity.status('Import', 'Choose a recording on this computer…');
+        try {
+          if (!projects.active) await projects.create('Linked recording');
+          const result = await window.hiLiteDesktop!.linkProject(projects.active!.id);
+          if (result.status === 'cancelled') { activity.finish('Import', 'File selection cancelled'); return; }
+          if (result.status !== 'ok' || !result.task_id) throw new Error(result.message || 'Could not link this recording.');
+          await pollImport(result.task_id);
+        } catch (error) {
+          activity.finish('Import', 'Ready to retry');
+          activity.error('Import', error instanceof Error ? error.message : 'Could not link the recording.', 'Retry linking the file, or use Choose Video File to copy it into this project.');
+        } finally { uploadButton.disabled = false; projectBusy('import', false); }
+      });
+    }
+    mountRelink(app.querySelector('.upload-box')!, activity);
+
     videoInput.addEventListener("change", async (e) => {
       const file = (e.target as HTMLInputElement).files?.[0];
       if (!file || uploadButton.disabled) return;
       // Allow choosing the same file again after an upload or polling error.
       videoInput.value = "";
   
+      projectBusy("import", true);
       uploadButton.disabled = true;
       app.querySelectorAll<HTMLButtonElement>("button[data-format]").forEach(button => button.disabled = true);
       uploadButton.textContent = "Uploading...";
@@ -472,7 +775,8 @@ interface Segment {
       formData.append("video", file);
   
       try {
-        const response = await fetch("/api/upload", {
+        if (projects.enabled && !projects.active) await projects.create(file.name.replace(/\.[^.]+$/, '').slice(0, 120) || 'Untitled project');
+        const response = await fetch(projects.url("/api/upload"), {
           method: "POST",
           body: formData
         });
@@ -480,30 +784,7 @@ interface Segment {
         const result = await response.json();
   
         if (response.ok && result.status === "ok" && typeof result.task_id === "string" && result.task_id) {
-          const taskId = result.task_id;
-          activity.status("Import", "Processing video…");
-          
-          // Sequential polling stays inside the upload error handler and stops
-          // when this screen is replaced. Bindings belong to its fresh nodes.
-          while (app.contains(uploadButton)) {
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            if (!app.contains(uploadButton)) return;
-            const statusResponse = await fetch(`/api/processing-status/${encodeURIComponent(taskId)}`);
-            if (!statusResponse.ok) throw new Error("Could not check video processing status.");
-            const status = await statusResponse.json();
-  
-            activity.status("Import", status.message || "Processing…", status.progress);
-  
-            if (status.status === "complete") {
-              activity.finish("Import", "Complete! Loading segments…");
-              await main(file.name);
-              return;
-            } else if (status.status === "error") {
-              throw new Error(status.message || "Video processing failed.");
-            } else if (status.status !== "processing") {
-              throw new Error("Invalid video processing status. Please try again.");
-            }
-          }
+          await pollImport(result.task_id, file.name);
         } else {
           throw new Error(result.message);
         }
@@ -513,6 +794,10 @@ interface Segment {
         activity.error("Import", err instanceof Error ? err.message : "Upload failed", "Choose the video file again to retry.");
         uploadButton.disabled = false;
         uploadButton.textContent = "Choose Video File";
+      } finally {
+        uploadButton.disabled = false;
+        uploadButton.textContent = 'Choose Video File';
+        projectBusy("import", false);
       }
     });
   }
@@ -556,6 +841,7 @@ interface Segment {
             <div class="stat-item">Duration: <strong id="selectedDuration">0.0s</strong></div>
             <span id="filterSummary" role="status"></span>
           </div>
+          ${projects.active ? '<section id="transcriptEditorTools" aria-label="Editing tools"></section>' : ''}
           <div class="segments-list" id="segmentsList"></div>
         </section>
       </main>
@@ -618,7 +904,7 @@ interface Segment {
       </aside>
       <div class="drawer-backdrop" id="drawerBackdrop"></div>
     `, true);
-    const context = recordingName || "Current recording";
+    const context = projects.active?.name || recordingName || "Current recording";
     document.getElementById("recordingContext")!.textContent = context;
     document.getElementById("recordingContext")!.title = context;
     document.getElementById("sourceInfo")!.textContent = `${context} · ${segments.length} segments · ${segments.reduce((sum, segment) => sum + segment.duration, 0).toFixed(1)}s of clips`;
@@ -633,6 +919,7 @@ interface Segment {
     const mainVideo = document.getElementById("mainVideo") as HTMLVideoElement;
     const exportBtn = document.getElementById("exportBtn") as HTMLButtonElement;
     mountSubtitles(document.getElementById("mediaBody")!, activity);
+    mountRelink(document.getElementById("mediaBody")!, activity);
     const downloadLink = document.getElementById("downloadLink") as HTMLAnchorElement;
     const autoGenerateBtn = document.getElementById("autoGenerateBtn") as HTMLButtonElement;
     const autoDownloadLink = document.getElementById("autoDownloadLink") as HTMLAnchorElement;
@@ -664,7 +951,17 @@ interface Segment {
     const llmTestBtn = document.getElementById("llmTestBtn") as HTMLButtonElement;
     const llmTestResult = document.getElementById("llmTestResult")!;
 
-    const selectedIds = new Set<number>();
+    const savedState = projects.active?.state || {};
+    const savedSelection = Array.isArray(savedState.selected_ids) ? savedState.selected_ids : [];
+    const selectedIds = new Set<number>(segments.filter(segment => savedSelection.includes(segment.id)).map(segment => segment.id));
+    if (typeof savedState.instructions === 'string') instructionsInput.value = savedState.instructions;
+    if (typeof savedState.min_score === 'number' && savedState.min_score >= 1 && savedState.min_score <= 10) minScoreSlider.value = String(savedState.min_score);
+    const keywordFilter = document.getElementById('showOnlyKeywords') as HTMLInputElement;
+    keywordFilter.checked = savedState.keyword_only === true;
+    function saveEditorState() {
+      projects.update({ selected_ids: segments.filter(segment => selectedIds.has(segment.id)).map(segment => segment.id), instructions: instructionsInput.value,
+        min_score: Number(minScoreSlider.value), keyword_only: keywordFilter.checked });
+    }
     let currentSegmentId: number | null = null;
     let llmAvailable = false;
     let autoGenerating = false;
@@ -926,10 +1223,24 @@ interface Segment {
     });
     const disposeCurrentShell = disposeShell;
     disposeShell = () => { timeline.dispose(); disposeCurrentShell(); };
+    if (projects.active) {
+      const disposeEditor = mountTranscriptEditor({
+        container: document.getElementById('transcriptEditorTools')!,
+        projectId: projects.active.id, sourceUrl: source?.url || null, segments,
+        get state() { return projects.active?.state || {}; },
+        onChange: patch => projects.update(patch),
+        onBusy: busy => projectBusy('transcript-editor', busy),
+        onOpen: () => mainVideo.pause(),
+      });
+      const disposeWorkspace = disposeShell;
+      disposeShell = () => { disposeEditor(); disposeWorkspace(); };
+    }
     markReviewed(undefined);
   
+    if (projects.enabled) uploadNewBtn.textContent = 'New / Open Project';
     uploadNewBtn.addEventListener("click", () => {
       if (autoGenerating || exporting) return;
+      if (projects.enabled) { openProjectPicker(); return; }
       if (confirm("Upload a new video? Current progress will be lost.")) {
         // Clear the current view and show upload interface
         showUploadInterface();
@@ -1008,6 +1319,7 @@ interface Segment {
           else selectedIds.delete(seg.id);
           div.classList.toggle("selected", checkbox.checked);
           updateStats();
+          saveEditorState();
         });
   
         const playBtn = div.querySelector(".play-btn") as HTMLButtonElement;
@@ -1033,19 +1345,21 @@ interface Segment {
       updateFilterSummary();
     }
   
-    renderSegments();
+    renderSegments(keywordFilter.checked);
     updateStats();
   
     document.getElementById("selectAll")!.addEventListener("click", () => {
       segments.forEach(s => selectedIds.add(s.id));
       renderSegments((document.getElementById("showOnlyKeywords") as HTMLInputElement).checked);
       updateStats();
+      saveEditorState();
     });
   
     document.getElementById("selectNone")!.addEventListener("click", () => {
       selectedIds.clear();
       renderSegments((document.getElementById("showOnlyKeywords") as HTMLInputElement).checked);
       updateStats();
+      saveEditorState();
     });
   
     document.getElementById("selectKeywords")!.addEventListener("click", () => {
@@ -1053,34 +1367,38 @@ interface Segment {
       segments.filter(s => s.is_keyword).forEach(s => selectedIds.add(s.id));
       renderSegments((document.getElementById("showOnlyKeywords") as HTMLInputElement).checked);
       updateStats();
+      saveEditorState();
     });
   
     document.getElementById("showOnlyKeywords")!.addEventListener("change", (e) => {
       renderSegments((e.target as HTMLInputElement).checked);
+      saveEditorState();
     });
   
     advancedToggle.addEventListener("click", () => {
       setAdvanced(!advancedSection.classList.contains("visible"));
     });
   
-    minScoreSlider.addEventListener("input", updateScoringSummary);
-    instructionsInput.addEventListener("input", updateScoringSummary);
+    minScoreSlider.addEventListener("input", () => { updateScoringSummary(); saveEditorState(); });
+    instructionsInput.addEventListener("input", () => { updateScoringSummary(); saveEditorState(); });
   
     resetSettingsBtn.addEventListener("click", () => {
       minScoreSlider.value = "7";
       updateScoringSummary();
+      saveEditorState();
     });
   
     previewBtn.addEventListener("click", async () => {
       if (previewBtn.disabled) return;
       const selection = readScoringSelection();
+      projectBusy("statistics", true);
       previewBtn.disabled = true;
       previewBtn.style.opacity = "0.5";
       previewBtn.textContent = "Loading...";
       if (!autoGenerating && !exporting) activity.status("Selection Statistics", "Loading score-filter estimate…");
       
       try {
-        const response = await fetch("/api/preview-auto-export", {
+        const response = await fetch(projects.url("/api/preview-auto-export"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(selection)
@@ -1110,6 +1428,7 @@ interface Segment {
         previewInfo.classList.remove("visible");
         activity.error("Selection Statistics", "Failed to load selection statistics.", "Retry Selection Statistics when the backend is ready.");
       } finally {
+        projectBusy("statistics", false);
         previewBtn.disabled = false;
         previewBtn.style.opacity = "1";
         previewBtn.textContent = "Selection Statistics";
@@ -1135,6 +1454,7 @@ interface Segment {
         return;
       }
 
+      projectBusy("auto", true);
       autoGenerating = true;
       uploadNewBtn.disabled = true;
       autoGenerateBtn.disabled = true;
@@ -1142,7 +1462,7 @@ interface Segment {
       if (!exporting) activity.status("Auto-generation", "Starting…");
 
       try {
-        const response = await fetch("/api/auto-generate", {
+        const response = await fetch(projects.url("/api/auto-generate"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1160,14 +1480,28 @@ interface Segment {
 
         if (autoDownloadRow.contains(document.activeElement)) document.getElementById("activityToggle")!.focus();
         autoDownloadRow.classList.remove("visible");
+        activity.trackTask("Auto-generation", result.task_id);
         activity.status("Auto-generation", "Processing…");
         // Poll the task: AI scoring can take a minute or two
         const deadline = Date.now() + 15 * 60 * 1000;
-        while (Date.now() < deadline) {
+        while (Date.now() < deadline || activity.isCancelling("Auto-generation")) {
           await new Promise((r) => setTimeout(r, 3000));
-          const statusResponse = await fetch(`/api/processing-status/${result.task_id}`);
-          const status = await statusResponse.json();
-
+          let status;
+          try {
+            const statusResponse = await fetch(projects.url(`/api/processing-status/${encodeURIComponent(result.task_id)}`));
+            if (!statusResponse.ok) throw new Error('Could not check auto-generation status.');
+            status = await statusResponse.json();
+          } catch (error) {
+            if (!activity.isCancelling('Auto-generation')) throw error;
+            activity.error('Auto-generation status', 'Could not confirm that the worker has stopped.', 'Waiting for the backend connection before allowing another generation.');
+            continue;
+          }
+          activity.clearError('Auto-generation status');
+          if (status.status === 'cancelled') {
+            activity.clearError('Auto-generation');
+            activity.finish('Auto-generation', 'Cancelled. Your selected clips are unchanged.');
+            return;
+          }
           if (status.status === "complete") {
             autoDownloadLink.href = status.output_file;
             autoDownloadLink.target = "_blank";
@@ -1192,6 +1526,8 @@ interface Segment {
         console.error(err);
         activity.error("Auto-generation", "Failed to auto-generate highlight reel.", "Check the backend connection and retry Generate.");
       } finally {
+        activity.endTask("Auto-generation");
+        projectBusy("auto", false);
         autoGenerating = false;
         uploadNewBtn.disabled = exporting;
         setAutoGenerateEnabled(llmAvailable);
@@ -1205,10 +1541,11 @@ interface Segment {
       if (!confirm("Discard this auto-generated reel? You can then try a new prompt or pick clips manually.")) return;
 
       const href = autoDownloadLink.getAttribute("href");
+      projectBusy("discard", true);
       discardAutoBtn.disabled = true;
       try {
         if (href) {
-          const response = await fetch("/api/discard-reel", {
+          const response = await fetch(projects.url("/api/discard-reel"), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ output_file: href })
@@ -1227,12 +1564,14 @@ interface Segment {
         console.error("Failed to delete reel on server:", err);
         activity.error("Discard", "Failed to discard reel.", "Check the backend connection and retry Discard.");
       } finally {
+        projectBusy("discard", false);
         discardAutoBtn.disabled = false;
       }
     });
 
     exportBtn.addEventListener("click", async () => {
       if (exporting || selectedIds.size === 0) return;
+      projectBusy("export", true);
       exporting = true;
       uploadNewBtn.disabled = true;
       const payload = { selected_ids: Array.from(selectedIds) };
@@ -1240,7 +1579,7 @@ interface Segment {
       exportBtn.textContent = "Generating...";
       if (!autoGenerating) activity.status("Manual export", "Generating highlight reel…");
       try {
-        const response = await fetch("/api/export", {
+        const response = await fetch(projects.url("/api/export"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload)
@@ -1261,6 +1600,7 @@ interface Segment {
         console.error(err);
         activity.error("Manual export", "Failed to send selected segments.", "Check the backend connection and retry Create Reel from Selected Clips.");
       } finally {
+        projectBusy("export", false);
         exporting = false;
         uploadNewBtn.disabled = autoGenerating;
         updateStats();
@@ -1270,4 +1610,15 @@ interface Segment {
     });
   }
   
-  main();
+  async function start() {
+    try {
+      await projects.discover();
+      await main();
+    } catch (error) {
+      document.getElementById('app')!.innerHTML = shellMarkup('<main class="upload-box"><h2>Projects unavailable</h2><p id="projectLoadError"></p><button id="retryProjectLoad">Retry loading projects</button></main>');
+      setupShell();
+      document.getElementById('projectLoadError')!.textContent = error instanceof Error ? error.message : 'Could not connect to the project store.';
+      document.getElementById('retryProjectLoad')!.addEventListener('click', () => { void start(); });
+    }
+  }
+  void start();

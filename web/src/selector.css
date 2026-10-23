@@ -276,3 +276,22 @@ h2 { font-size: 14px; font-weight: 650; line-height: 1.4; }
 @media (min-width: 481px) and (max-width: 959px) and (min-height: 600px) {
   .central-editor { grid-template-rows: minmax(300px, 48%) minmax(0, 1fr); }
 }
+
+/* Saved projects never replace the recording in an existing project. */
+.project-navigation { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+#projectSaveStatus { color: var(--studio-muted); font-size: 11px; }
+#projectSaveStatus.save-error, .project-save-error { color: var(--studio-error); }
+.project-save-error { margin-top: 6px; font-size: 12px; overflow-wrap: anywhere; }
+.project-dialog { color: var(--studio-text); background: var(--studio-panel); border: 1px solid var(--studio-input-line); border-radius: 8px; padding: 0; width: min(560px, calc(100vw - 24px)); max-height: calc(100dvh - 32px); }
+.project-dialog::backdrop { background: var(--studio-backdrop); }
+.project-dialog-body { padding: 18px; }
+.project-dialog-body > * + * { margin-top: 16px; }
+.project-dialog form { display: grid; gap: 10px; }
+.project-dialog h3 { font-size: 14px; }
+.project-dialog [role='alert'] { color: var(--studio-error); font-size: 13px; }
+#recentProjects { display: grid; gap: 8px; }
+.recent-project { display: grid; gap: 4px; text-align: left; overflow-wrap: anywhere; }
+.recent-project span { color: var(--studio-muted); font-size: 12px; }
+@media (max-width: 480px) {
+  .shell-header:has(.header-actions) .project-navigation { grid-column: 1 / -1; grid-row: 3; }
+}

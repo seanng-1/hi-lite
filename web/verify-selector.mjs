@@ -32,7 +32,7 @@ const dist = fileURLToPath(new URL("dist/", import.meta.url));
 assert.ok(existsSync(join(dist, "index.html")), "Run npm run build first.");
 const server = createServer((request, response) => {
   const path = new URL(request.url, "http://localhost").pathname;
-  if (path === sourceUrl) {
+  if (path === sourceUrl || /^\/api\/projects\/[a-zA-Z0-9_-]+/.test(path) && path.endsWith(sourceUrl)) {
     const content = readFileSync(mediaPath);
     const range = /bytes=(\d+)-(\d*)/.exec(request.headers.range || '');
     const first = range ? Number(range[1]) : 0;
@@ -179,7 +179,7 @@ try {
   let scriptId;
   let caseId = 0;
   async function load(body = fixture, { raw = false, status = 200, networkError = false, llmAvailable = false,
-    llmSettings, llmStatusError = false, criteria = 'Great plays', llmStatusDelayed = false, source = true } = {}) {
+    llmSettings, llmStatusError = false, criteria = 'Great plays', llmStatusDelayed = false, source = true, projects = false, desktop = false } = {}) {
     if (!raw && source && body?.segments?.length) body = { ...body, source: { id: sourceId, url: sourceUrl } };
     if (scriptId) await page("Page.removeScriptToEvaluateOnNewDocument", { identifier: scriptId });
     caseId++;
@@ -187,6 +187,24 @@ try {
       window.__case = ${caseId};
       window.__fixture = ${JSON.stringify({ ...fixture, source: { id: sourceId, url: sourceUrl } })};
       window.__manifest = ${JSON.stringify({ body: raw ? body : JSON.stringify(body), status, networkError })};
+      window.__projectStore = ${JSON.stringify(projects ? {
+        first: { id: 'first', name: 'First recording', revision: 1, has_media: true, state: { selected_ids: [4], instructions: 'Saved criteria', min_score: 8, keyword_only: false, edits: [{ kind: 'future-edit' }] } },
+        second: { id: 'second', name: '<img src=x onerror=window.__injected=true>', revision: 3, has_media: true, state: { selected_ids: [9], instructions: 'Other criteria', min_score: 6 } }
+      } : null)};
+      window.__desktopCalls = [];
+      window.__desktopResult = { status: 'cancelled' };
+      if (${JSON.stringify(desktop)}) window.hiLiteDesktop = {
+        async linkProject(projectId) {
+          window.__desktopCalls.push({ action: 'link', projectId });
+          if (window.__desktopResult.status === 'ok') window.__projectStore[projectId].has_media = true;
+          return window.__desktopResult;
+        },
+        async relinkProject(projectId) {
+          window.__desktopCalls.push({ action: 'relink', projectId });
+          return window.__desktopResult;
+        }
+      };
+      localStorage.removeItem('hi-lite.active-project');
       window.__requests = [];
       window.__uploads = 0;
       window.__confirmCount = 0;
@@ -208,9 +226,46 @@ try {
       window.setTimeout = (fn, delay, ...args) => nativeTimeout(fn, delay === 2000 || delay === 3000 ? 0 : delay, ...args);
       const nativeFetch = window.fetch;
       window.fetch = async (input, options) => {
-        const path = new URL(input, location.href).pathname;
+        let path = new URL(input, location.href).pathname;
         window.__requests.push({ path, options });
         const json = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
+        if (window.__projectStore && path === '/api/projects') {
+          if (options?.method === 'POST') {
+            const project = { id: 'new-' + Object.keys(window.__projectStore).length, name: JSON.parse(options.body).name, revision: 0, state: { selected_ids: [], edits: [] }, has_media: false };
+            window.__projectStore[project.id] = project;
+            return json(project, 201);
+          }
+          return json({ projects: Object.values(window.__projectStore) });
+        }
+        const scoped = path.match(/^\\/api\\/projects\\/([^/]+)(.*)$/);
+        if (window.__projectStore && scoped) {
+          const project = window.__projectStore[scoped[1]];
+          if (!project) return json({}, 404);
+          if (!scoped[2]) {
+            if (options?.method === 'PUT') {
+              if (window.__holdSave) await new Promise(resolve => { window.__finishSave = resolve; });
+              if (window.__saveError) return json({ message: 'Save failed' }, window.__saveError);
+              const body = JSON.parse(options.body);
+              if (body.revision !== project.revision) return json({}, 409);
+              project.state = body.state;
+              project.revision++;
+            }
+            return json(project);
+          }
+          path = scoped[2];
+          if (path === '/data/segments_manifest.json') return project.has_media ? json({ ...window.__fixture, source: { id: ${JSON.stringify(sourceId)}, url: '/api/projects/' + project.id + ${JSON.stringify(sourceUrl)} } }) : json({}, 404);
+          if (path === '/api/upload') project.has_media = true;
+        }
+        if (path.startsWith('/api/cancel/')) {
+          if (window.__cancelError) return json({ status: 'error', message: 'Cancellation unavailable' }, window.__cancelError);
+          window.__cancelRequested = true;
+          return json({ status: 'cancelling' });
+        }
+        if (window.__cancellableTask && path.startsWith('/api/processing-status/')) {
+          await new Promise(resolve => nativeTimeout(resolve, 20));
+          if (window.__cancelRequested && window.__cancelStatusFailure) throw new TypeError('Temporary status outage');
+          return json({ status: window.__cancelRequested ? window.__holdCancellation ? 'cancelling' : 'cancelled' : 'processing', message: 'Working…' });
+        }
         if (window.__busyPaths?.includes(path)) return json({ status: "error", message: "Hi-Lite is busy processing another operation. Please wait for it to finish." }, 409);
         if (window.__errors?.[path]) return json(window.__errors[path].body, window.__errors[path].status);
         if (path === "/data/segments_manifest.json") {
@@ -296,13 +351,13 @@ try {
     await page("Page.navigate", { url });
     await until(`window.__case === ${caseId} && !!document.querySelector('.upload-container, .main-container')`);
     assert.equal(await evaluate('location.search'), '', 'Every screen loads at the default URL');
-    if (await evaluate("!!document.getElementById('aiInstructions')")) await setScoring(criteria, 7);
+    if (criteria !== null && await evaluate("!!document.getElementById('aiInstructions')")) await setScoring(criteria, 7);
     if (await evaluate("document.getElementById('mainVideo')?.getAttribute('src') === " + JSON.stringify(sourceUrl)))
       await until("document.getElementById('sourceScrubber').getAttribute('aria-disabled') === 'false'");
   }
   const ids = () => evaluate("[...document.querySelectorAll('.segment-row .segment-id')].map(el => Number(el.textContent))");
   const selected = () => evaluate("[...document.querySelectorAll('.segment-checkbox:checked')].map(el => Number(el.dataset.id))");
-  async function upload() {
+  async function upload(wait = true) {
     await evaluate(`(() => {
       const input = document.getElementById('videoInput');
       const files = new DataTransfer();
@@ -311,7 +366,7 @@ try {
       input.dispatchEvent(new Event('change'));
       input.dispatchEvent(new Event('change'));
     })()`);
-    await until("!!document.querySelector('.main-container') || document.getElementById('uploadButton')?.disabled === false");
+    if (wait) await until("!!document.querySelector('.main-container') || document.getElementById('uploadButton')?.disabled === false");
   }
 
   await test("original recording subtitles download repeatedly and ignore highlight controls", async () => {
@@ -1632,6 +1687,179 @@ try {
     const hover=await evaluate(`(() => {const r=document.querySelector('button.primary').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
     await page('Input.dispatchMouseEvent',{type:'mouseMoved',...hover});
     assert.notEqual(await evaluate("getComputedStyle(document.querySelector('button.primary')).backgroundColor"),'rgb(105, 36, 117)','Primary hover uses its lighter plum variant');
+  });
+
+  await test('projects reopen saved selections and criteria without uploading or retranscribing', async () => {
+    await load(fixture, { projects: true, criteria: null });
+    assert.deepEqual(await selected(), [4]);
+    assert.equal(await evaluate("document.getElementById('aiInstructions').value"), 'Saved criteria');
+    assert.equal(await evaluate("document.getElementById('minScoreSlider').value"), '8');
+    assert.equal(await evaluate("document.getElementById('mainVideo').getAttribute('src')"), '/api/projects/first' + sourceUrl);
+    await click('#selectAll');
+    await setScoring('New project criteria', 9);
+    await click('#projectsTrigger');
+    await click('[data-project-id="second"]');
+    await until("document.getElementById('recordingContext').textContent.startsWith('<img') && !document.getElementById('projectDialog')");
+    assert.deepEqual(await selected(), [9]);
+    assert.deepEqual(await evaluate("window.__projectStore.first.state.selected_ids"), [0, 4, 9]);
+    assert.deepEqual(await evaluate("window.__projectStore.first.state.edits"), [{ kind: 'future-edit' }], 'Unknown edit state survives autosave');
+    assert.equal(await evaluate('window.__injected'), false);
+    await click('#projectsTrigger');
+    await click('[data-project-id="first"]');
+    await until("document.getElementById('recordingContext').textContent === 'First recording' && !document.getElementById('projectDialog')");
+    assert.deepEqual(await selected(), [0, 4, 9]);
+    assert.equal(await evaluate("document.getElementById('aiInstructions').value"), 'New project criteria');
+    assert.equal(await evaluate("document.getElementById('minScoreSlider').value"), '9');
+    assert.equal(await evaluate('window.__uploads'), 0);
+    assert.equal(await evaluate("window.__requests.some(r => r.path === '/data/segments_manifest.json')"), false);
+  });
+
+  await test('new projects keep existing media and cancel leaves the current editor intact', async () => {
+    await load(fixture, { projects: true, criteria: null });
+    await click('#projectsTrigger');
+    await click('#closeProjects');
+    assert.deepEqual(await selected(), [4]);
+    await click('#projectsTrigger');
+    await evaluate("document.getElementById('newProjectName').value = 'Fresh project'");
+    await click('#newProjectForm button');
+    await until("document.getElementById('recordingContext').textContent === 'Fresh project' && !!document.getElementById('uploadButton')");
+    assert.equal(await evaluate('window.__projectStore.first.has_media'), true);
+    assert.deepEqual(await evaluate('window.__projectStore.first.state.selected_ids'), [4]);
+    assert.equal(await evaluate('window.__uploads'), 0);
+    assert.equal(await evaluate("localStorage.getItem('hi-lite.active-project')"), 'new-2');
+    await click('#projectsTrigger');
+    await click('[data-project-id="first"]');
+    await until("!!document.getElementById('selectAll')");
+    assert.deepEqual(await selected(), [4]);
+  });
+
+  await test('failed project saves block switching and preserve changes until retry succeeds', async () => {
+    await load(fixture, { projects: true, criteria: null });
+    await evaluate('window.__saveError = 503');
+    await click('#selectAll');
+    await click('#projectsTrigger');
+    await click('[data-project-id="second"]');
+    await until("document.querySelector('#projectDialog [role=alert]').textContent.includes('Could not save')");
+    assert.equal(await evaluate("document.getElementById('recordingContext').textContent"), 'First recording');
+    assert.deepEqual(await selected(), [0, 4, 9]);
+    await evaluate('window.__saveError = null');
+    await click('[data-project-id="second"]');
+    await until("!document.getElementById('projectDialog')");
+    assert.deepEqual(await evaluate('window.__projectStore.first.state.selected_ids'), [0, 4, 9]);
+    assert.deepEqual(await selected(), [9]);
+  });
+
+  await test('desktop source linking handles cancellation, import and safe relinking without uploading', async () => {
+    await load(fixture, { projects: true, criteria: null });
+    assert.equal(await evaluate("!!document.getElementById('relinkSource')"), false, 'Web mode has no privileged desktop controls');
+    await load(fixture, { projects: true, criteria: null, desktop: true });
+    await click('#selectAll');
+    await click('#mediaTrigger');
+    await evaluate("window.__desktopResult = { status: 'ok' }");
+    await click('#relinkSource');
+    await until("!document.querySelector('.editor-shell').dataset.drawer && !document.getElementById('projectsTrigger').disabled");
+    assert.deepEqual(await selected(), [0, 4, 9]);
+    assert.deepEqual(await evaluate('window.__projectStore.first.state.selected_ids'), [0, 4, 9]);
+    await click('#projectsTrigger');
+    await evaluate("document.getElementById('newProjectName').value = 'Linked source'");
+    await click('#newProjectForm button');
+    await until("!!document.getElementById('linkSource')");
+    await evaluate("window.__desktopResult = { status: 'cancelled' }");
+    await click('#linkSource');
+    await until("!document.getElementById('linkSource').disabled");
+    assert.equal(await evaluate("document.getElementById('uploadButton').disabled"), false);
+    await evaluate("window.__desktopResult = { status: 'ok', task_id: 'fixture-task' }");
+    await click('#linkSource');
+    await until("!!document.getElementById('selectAll') && !document.getElementById('projectsTrigger').disabled");
+    assert.equal(await evaluate('window.__uploads'), 0);
+    assert.deepEqual(await evaluate('window.__desktopCalls'), [
+      { action: 'relink', projectId: 'first' }, { action: 'link', projectId: 'new-2' }, { action: 'link', projectId: 'new-2' }
+    ]);
+    assert.equal(await evaluate("window.__requests.some(r => r.path.startsWith('/api/desktop/'))"), false, 'Privileged native route is never called by the renderer');
+  });
+
+  await test('autosave serializes edits during a request and never overwrites a revision conflict', async () => {
+    await load(fixture, { projects: true, criteria: null });
+    await evaluate('window.__holdSave = true');
+    await click('#selectAll');
+    await until('!!window.__finishSave');
+    await click('#selectNone');
+    await evaluate('window.__holdSave = false; window.__finishSave()');
+    await until("window.__projectStore.first.state.selected_ids.length === 0 && document.getElementById('projectSaveStatus').textContent === 'All changes saved'");
+    const saves = await evaluate("window.__requests.filter(r => r.path === '/api/projects/first' && r.options?.method === 'PUT').map(r => JSON.parse(r.options.body))");
+    assert.deepEqual(saves.map(save => save.revision), [1, 2]);
+    assert.deepEqual(saves.map(save => save.state.selected_ids), [[0, 4, 9], []]);
+    await evaluate('window.__projectStore.first.revision++');
+    await click('#selectAll');
+    await until("!document.getElementById('projectReload').hidden");
+    assert.deepEqual(await evaluate('window.__projectStore.first.state.selected_ids'), []);
+    assert.deepEqual(await selected(), [0, 4, 9]);
+    assert.match(await evaluate("document.getElementById('projectSaveError').textContent"), /another window/);
+    await click('#projectReload');
+    await until("document.getElementById('projectReload').hidden");
+    assert.deepEqual(await selected(), []);
+  });
+
+  await test('upload cancellation stays blocked until terminal status and allows the same file to retry', async () => {
+    await load({ segments: [] });
+    await evaluate('window.__cancellableTask = true; window.__holdCancellation = true');
+    await upload(false);
+    await until("!document.getElementById('activityCancel').hidden");
+    await click('#activityCancel');
+    await until('window.__cancelRequested');
+    assert.equal(await evaluate("document.getElementById('uploadButton').disabled"), true);
+    assert.equal(await evaluate("document.getElementById('activityCancel').disabled"), true);
+    await evaluate('window.__cancelStatusFailure = true');
+    await until("document.getElementById('activityErrors').textContent.includes('worker has stopped')");
+    assert.equal(await evaluate("document.getElementById('uploadButton').disabled"), true);
+    await evaluate('window.__cancelStatusFailure = false; window.__holdCancellation = false');
+    await until("!document.getElementById('uploadButton').disabled && document.getElementById('activityCancel').hidden");
+    assert.match(await evaluate("document.getElementById('statusMessage').textContent"), /Cancelled/);
+    assert.equal(await evaluate("document.getElementById('activityErrors').children.length"), 0);
+    await evaluate('window.__cancellableTask = false');
+    await upload();
+    assert.deepEqual(await ids(), [0, 4, 9]);
+    assert.equal(await evaluate('window.__uploads'), 2);
+  });
+
+  await test('AI cancellation retries failed requests, preserves selections and waits for terminal acknowledgement', async () => {
+    await load(fixture, { projects: true, llmAvailable: true, criteria: null });
+    await until("!document.getElementById('autoGenerateBtn').disabled");
+    await evaluate('window.__cancellableTask = true; window.__holdCancellation = true; window.__cancelError = 503');
+    await click('#autoGenerateBtn');
+    await until("!document.getElementById('activityCancel').hidden");
+    await click('#activityCancel');
+    await until("document.getElementById('activityCancel').textContent === 'Retry cancellation'");
+    assert.equal(await evaluate("document.getElementById('autoGenerateBtn').disabled && document.getElementById('projectsTrigger').disabled"), true);
+    await evaluate('window.__cancelError = null');
+    await click('#activityCancel');
+    await until('window.__cancelRequested');
+    assert.equal(await evaluate("document.getElementById('autoGenerateBtn').disabled && document.getElementById('projectsTrigger').disabled"), true);
+    await evaluate('window.__holdCancellation = false');
+    await until("!document.getElementById('autoGenerateBtn').disabled && !document.getElementById('projectsTrigger').disabled");
+    assert.match(await evaluate("document.getElementById('statusMessage').textContent"), /Cancelled/);
+    assert.deepEqual(await selected(), [4]);
+    assert.equal(await evaluate("window.__requests.filter(r => r.path === '/api/projects/first/api/cancel/fixture-auto-task').length"), 2);
+    assert.equal(await evaluate("document.getElementById('activityErrors').children.length"), 0);
+  });
+
+  await test('linked desktop imports use the same cancellable project task lifecycle', async () => {
+    await load(fixture, { projects: true, criteria: null, desktop: true });
+    await click('#projectsTrigger');
+    await evaluate("document.getElementById('newProjectName').value = 'Cancel linked import'");
+    await click('#newProjectForm button');
+    await until("!!document.getElementById('linkSource')");
+    await evaluate("window.__desktopResult = { status: 'ok', task_id: 'fixture-task' }; window.__cancellableTask = true; window.__holdCancellation = true");
+    await click('#linkSource');
+    await until("!document.getElementById('activityCancel').hidden");
+    await click('#activityCancel');
+    await until('window.__cancelRequested');
+    assert.equal(await evaluate("document.getElementById('linkSource').disabled && document.getElementById('projectsTrigger').disabled"), true);
+    await evaluate('window.__holdCancellation = false');
+    await until("!document.getElementById('linkSource').disabled && !document.getElementById('projectsTrigger').disabled");
+    assert.match(await evaluate("document.getElementById('statusMessage').textContent"), /Cancelled/);
+    assert.equal(await evaluate('window.__uploads'), 0);
+    assert.equal(await evaluate("window.__requests.some(r => r.path === '/api/projects/new-2/api/cancel/fixture-task')"), true);
   });
 
   assert.deepEqual(exceptions, [], "No uncaught JavaScript exceptions or unhandled rejections");

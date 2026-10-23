@@ -2,10 +2,10 @@
 export interface SourceReference { id: string; url: string; }
 interface Interval { id: number; start: number; end: number; }
 
-export function readSource(data: unknown): SourceReference | null {
+export function readSource(data: unknown, projectPrefix = ''): SourceReference | null {
   if (typeof data !== 'object' || !data) return null;
   const source = (data as { source?: SourceReference }).source;
-  return source && /^[a-f0-9]{32}$/.test(source.id) && source.url === `/api/source/${source.id}` ? source : null;
+  return source && /^[a-f0-9]{32}$/.test(source.id) && source.url === `${projectPrefix}/api/source/${source.id}` ? source : null;
 }
 
 export function formatSourceTime(seconds: number): string {
