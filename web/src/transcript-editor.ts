@@ -29,6 +29,32 @@ const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 const time = (value: number) => `${Math.floor(Math.max(0, value) / 60)}:${(Math.max(0, value) % 60).toFixed(2).padStart(5, '0')}`;
 const total = (ranges: { start: number; end: number }[]) => ranges.reduce((sum, range) => sum + range.end - range.start, 0);
 
+/** A literal, case-insensitive phrase search. Whitespace may span aligned words. */
+function searchPattern(query: string): RegExp | null {
+  const phrase = query.trim();
+  return phrase ? new RegExp(phrase.split(/\s+/u).map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s+'), 'giu') : null;
+}
+export function findTranscriptMatches(cues: { text: string }[], query: string): number[] {
+  const pattern = searchPattern(query);
+  if (!pattern) return [];
+  return cues.flatMap((cue, index) => { pattern.lastIndex = 0; return pattern.test(cue.text) ? [index] : []; });
+}
+
+const exportPresets: { id: string; label: string; description: string; settings: Settings }[] = [
+  { id: 'shorts', label: 'Shorts', description: '9:16 · large outlined captions', settings: {
+    aspect_ratio: '9:16', crop: { x: 0.5, y: 0.5 }, burn_captions: true,
+    caption_style: { font_family: 'Arial', font_size: 56, font_color: '#ffffff', outline_color: '#000000', outline_width: 3, position: 'bottom' },
+  } },
+  { id: 'landscape', label: 'Landscape', description: '16:9 · no burned-in captions', settings: {
+    aspect_ratio: '16:9', crop: { x: 0.5, y: 0.5 }, burn_captions: false,
+    caption_style: { font_family: 'Arial', font_size: 42, font_color: '#ffffff', outline_color: '#000000', outline_width: 2, position: 'bottom' },
+  } },
+  { id: 'square', label: 'Square', description: '1:1 · outlined captions', settings: {
+    aspect_ratio: '1:1', crop: { x: 0.5, y: 0.5 }, burn_captions: true,
+    caption_style: { font_family: 'Arial', font_size: 48, font_color: '#ffffff', outline_color: '#000000', outline_width: 3, position: 'bottom' },
+  } },
+];
+
 /** Validate snapshots before rendering untrusted saved/API state. */
 export function readEditDocument(value: unknown): EditDocument {
   if (!record(value) || value.version !== 1 || !finite(value.source_duration) || value.source_duration < 0 || !Array.isArray(value.ranges)) throw new Error('The edit document could not be read.');
@@ -116,8 +142,10 @@ export function mountTranscriptEditor(options: TranscriptEditorOptions): () => v
   let suggestions: Suggestion[] = [], settings = readSettings(options.state.export_settings);
   const selected = new Set<string>(), selectedCandidates = new Set<string>();
   const undo: Snapshot[] = [], redo: Snapshot[] = [];
-  let previewRanges: { start: number; end: number }[] = [], previewIndex = 0, animation = 0;
+  let previewRanges: { start: number; end: number }[] = [], previewIndex = 0, animation = 0, playbackEpoch = 0, playbackRequested = false;
   let passageAnchor: { start: number; end: number } | null = null;
+  let searchMatches: number[] = [], activeMatch = -1;
+  const transcriptCards: HTMLElement[] = [];
   const tracked: { node: HTMLButtonElement | HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement; enabled: () => boolean }[] = [];
   const objectUrls = new Set<string>();
 
@@ -167,7 +195,7 @@ export function mountTranscriptEditor(options: TranscriptEditorOptions): () => v
     retryButton.disabled = loading;
     dialog.setAttribute('aria-busy', String(busy));
   }
-  function setBusy(value: boolean) { busy = value; options.onBusy?.(value); refreshControls(); }
+  function setBusy(value: boolean) { busy = value; if (value) pause(); options.onBusy?.(value); refreshControls(); }
   async function response(path: string, body?: unknown): Promise<Response> {
     const result = await fetch(prefix + '/api' + path, { signal, cache: 'no-store', ...(body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }) });
     if (!result.ok) {
@@ -191,28 +219,53 @@ export function mountTranscriptEditor(options: TranscriptEditorOptions): () => v
   const snapshot = (): Snapshot => clone({ document: editDocument, captions, settings, candidates });
   function save() { if (!disposed) options.onChange({ edit_document: clone(editDocument), edited_captions: clone(captions), export_settings: clone(settings), candidates: clone(candidates) }); }
   function remember() { undo.push(snapshot()); if (undo.length > 100) undo.shift(); redo.length = 0; }
-  function restore(value: Snapshot) { editDocument = value.document; captions = value.captions; settings = value.settings; candidates = value.candidates; selected.clear(); pause(); save(); render(); }
-  function commit(document: EditDocument, message: string) { remember(); editDocument = document; selected.clear(); pause(); save(); render(); status(message); }
+  function restore(value: Snapshot) { editDocument = value.document; captions = value.captions; settings = value.settings; candidates = value.candidates; selected.clear(); resetPreview(); save(); render(); }
+  function commit(document: EditDocument, message: string) { remember(); editDocument = document; selected.clear(); resetPreview(); save(); render(); status(message); }
   async function apply(action: Record<string, unknown>, message: string) {
     await run(async () => { const data = await json('/edit-preview', { document: editDocument, action }); if (disposed) return; commit(readEditDocument(data.document), message); });
   }
-  function pause() { video.pause(); window.cancelAnimationFrame(animation); animation = 0; }
+  function pause() { playbackEpoch++; playbackRequested = false; video.pause(); window.cancelAnimationFrame(animation); animation = 0; }
+  function resetPreview() {
+    pause(); previewRanges = clone(editDocument.ranges); previewIndex = 0;
+    if (options.sourceUrl && previewRanges.length) video.currentTime = previewRanges[0].start;
+  }
+  function requestPlayback() {
+    const epoch = ++playbackEpoch;
+    playbackRequested = true;
+    void video.play().then(() => { if (!playbackRequested || disposed || !dialog.open || busy) pause(); }).catch(error => {
+      if (epoch === playbackEpoch && !disposed && dialog.open) { playbackRequested = false; status(`Preview could not start: ${error instanceof Error ? error.message : String(error)}`, true); }
+    });
+  }
   function play(ranges: { start: number; end: number }[], position = 0) {
+    if (!loaded || busy || disposed || !dialog.open) return;
     if (!options.sourceUrl || !ranges.length) { status('Original source playback is unavailable.', true); return; }
     previewRanges = clone(ranges);
     const point = editedPosition(previewRanges, position)!;
     previewIndex = point.index; video.currentTime = point.sourceTime;
-    void video.play().catch(error => status(`Preview could not start: ${error.message}`, true));
+    requestPlayback();
+  }
+  function previewPosition() {
+    const range = previewRanges[previewIndex];
+    return range ? total(previewRanges.slice(0, previewIndex)) + Math.max(0, Math.min(range.end - range.start, video.currentTime - range.start)) : 0;
+  }
+  function togglePlayback() {
+    if (!video.paused) { pause(); return; }
+    const position = previewPosition();
+    play(previewRanges, position >= total(previewRanges) - 0.015 ? 0 : position);
+  }
+  function seekPreview(delta: number) {
+    const point = editedPosition(previewRanges, previewPosition() + delta);
+    if (!point || !options.sourceUrl) return;
+    previewIndex = point.index; video.currentTime = point.sourceTime; syncPlayback();
   }
   function syncPlayback() {
     window.cancelAnimationFrame(animation); animation = 0;
     const range = previewRanges[previewIndex];
     if (range && !video.paused && video.currentTime >= range.end - 0.015) {
       if (previewIndex + 1 < previewRanges.length) { previewIndex++; video.currentTime = previewRanges[previewIndex].start; }
-      else { video.pause(); video.currentTime = range.end; }
+      else { pause(); video.currentTime = range.end; }
     }
-    const current = previewRanges[previewIndex];
-    const elapsed = current ? total(previewRanges.slice(0, previewIndex)) + Math.max(0, Math.min(current.end - current.start, video.currentTime - current.start)) : 0;
+    const elapsed = previewPosition();
     seek.max = String(Math.max(0.001, total(previewRanges))); seek.value = String(elapsed);
     clock.textContent = `Edit ${time(elapsed)} / ${time(total(previewRanges))} · Source ${time(video.currentTime)}`;
     captionPreview.textContent = captions.filter(cue => cue.start <= video.currentTime && cue.end > video.currentTime).map(cue => cue.text).filter(Boolean).join('\n');
@@ -221,7 +274,7 @@ export function mountTranscriptEditor(options: TranscriptEditorOptions): () => v
   }
 
   const launcher = el('div', 'te-launcher');
-  const launch = button('Open transcript editor', () => { options.onOpen?.(); dialog.showModal(); if (!loaded) void load(); }, () => true, 'te-open');
+  const launch = button('Open transcript editor', () => { if (dialog.open) return; options.onOpen?.(); dialog.showModal(); if (!loaded) void load(); }, () => true, 'te-open');
   const launchStatus = el('span', 'te-muted', 'Trim, captions, crop and exports');
   launcher.append(launch, launchStatus);
   const dialog = el('dialog', 'te-dialog'); dialog.setAttribute('aria-label', 'Transcript editor');
@@ -242,26 +295,51 @@ export function mountTranscriptEditor(options: TranscriptEditorOptions): () => v
     catch (error) { status(error instanceof Error ? error.message : 'Cancellation failed.', true); cancelButton.disabled = false; }
   }); cancelButton.hidden = true;
   statusBar.append(statusNode, retryButton, cancelButton);
+  const shortcutHelp = el('details', 'te-shortcuts');
+  shortcutHelp.append(el('summary', '', 'Keyboard shortcuts'));
+  const shortcutList = el('dl', 'te-shortcut-list');
+  [
+    ['Space / K', 'Play or pause the current preview'], ['J / L', 'Seek backward / forward 5 seconds'],
+    ['/ or Ctrl/⌘ F', 'Search the source transcript'], ['Enter / Shift Enter', 'Next / previous match while searching'],
+    ['Esc in search', 'Clear search; Esc again closes the editor'], ['Delete', 'Remove selected ranges in Sequence'],
+    ['Ctrl/⌘ Z', 'Undo'], ['Ctrl/⌘ Shift Z or Ctrl/⌘ Y', 'Redo'], ['?', 'Show or hide this help'],
+  ].forEach(([keys, description]) => shortcutList.append(el('dt', '', keys), el('dd', '', description)));
+  shortcutHelp.append(shortcutList, el('p', 'te-muted', 'Editing and playback shortcuts pause while a task is running and never replace typing in a form field. Space keeps its normal action on buttons.'));
   const body = el('div', 'te-body');
   const preview = el('aside', 'te-preview'); preview.setAttribute('aria-label', 'Edited video preview and export settings');
   const videoFrame = el('div', 'te-video-frame');
   const video = el('video'); video.preload = 'metadata'; video.playsInline = true; video.setAttribute('aria-label', 'Edited source preview');
   const captionPreview = el('div', 'te-caption-preview'); captionPreview.hidden = true; videoFrame.append(video, captionPreview);
   const previewActions = el('div', 'te-actions');
-  previewActions.append(button('Play edit', () => play(editDocument.ranges), () => !!options.sourceUrl && !!editDocument.ranges.length, 'primary'), button('Pause', pause));
-  const seek = input('0', 'range', '0', '1', '0.01'); seek.setAttribute('aria-label', 'Seek edited sequence');
+  previewActions.append(button('Play edit', () => play(editDocument.ranges), () => !!options.sourceUrl && !!editDocument.ranges.length, 'primary'), button('Pause', pause),
+    button('Back 5s', () => seekPreview(-5), () => !!options.sourceUrl && !!previewRanges.length), button('Forward 5s', () => seekPreview(5), () => !!options.sourceUrl && !!previewRanges.length));
+  const seek = guard(input('0', 'range', '0', '1', '0.01'), () => !!options.sourceUrl && !!previewRanges.length); seek.setAttribute('aria-label', 'Seek edited sequence');
   const clock = el('output', 'te-muted', 'Edit 0:00.00 · Source 0:00.00');
   preview.append(videoFrame, previewActions, seek, clock, el('p', 'te-muted', 'Preview follows the cut order. Crop and caption positioning are approximate until rendered.'));
-  listen(video, 'play', () => { window.cancelAnimationFrame(animation); syncPlayback(); });
-  listen(video, 'pause', () => { window.cancelAnimationFrame(animation); animation = 0; });
+  listen(video, 'play', () => { if (!playbackRequested || disposed || !dialog.open || busy) { pause(); return; } window.cancelAnimationFrame(animation); syncPlayback(); });
+  listen(video, 'pause', () => { playbackRequested = false; window.cancelAnimationFrame(animation); animation = 0; });
   listen(video, 'ended', () => {
-    if (previewIndex + 1 < previewRanges.length) { previewIndex++; video.currentTime = previewRanges[previewIndex].start; void video.play().catch(error => status(`Preview could not continue: ${error.message}`, true)); }
+    if (disposed || !dialog.open || busy) return;
+    if (previewIndex + 1 < previewRanges.length) { previewIndex++; video.currentTime = previewRanges[previewIndex].start; requestPlayback(); }
     else syncPlayback();
   });
   listen(video, 'seeked', () => { if (video.paused) syncPlayback(); });
   listen(video, 'error', () => status('The source video could not load. Editing remains available; check that the recording still exists.', true));
   listen(seek, 'input', () => { const point = editedPosition(previewRanges, Number(seek.value)); if (point) { previewIndex = point.index; video.currentTime = point.sourceTime; } });
 
+  const presetBox = el('section', 'te-presets'); presetBox.setAttribute('aria-label', 'Export presets');
+  presetBox.append(el('h3', '', 'Export presets'), el('p', 'te-muted', 'One click sets framing and captions. Review the crop, fine-tune below, then export. Undo restores your previous settings.'));
+  const presetActions = el('div', 'te-preset-actions');
+  const presetButtons = exportPresets.map(preset => {
+    const node = button(preset.label, () => {
+      flushCaptionDrafts();
+      if (JSON.stringify(settings) === JSON.stringify(preset.settings)) { status(`${preset.label} preset is already applied.`); return; }
+      remember(); settings = clone(preset.settings); save(); renderSettings(); refreshControls(); status(`${preset.label} preset applied. Review the crop before exporting. Undo is available.`);
+    }, () => true, 'te-preset');
+    node.dataset.preset = preset.id; node.setAttribute('aria-label', `Apply ${preset.label} preset`); node.setAttribute('aria-pressed', 'false');
+    node.append(el('small', '', preset.description)); presetActions.append(node); return node;
+  });
+  presetBox.append(presetActions); preview.append(presetBox);
   const settingsBox = el('details', 'te-settings'); settingsBox.open = true; settingsBox.append(el('summary', '', 'Framing and captions'));
   const settingsFields = el('div', 'te-form-grid');
   const aspect = guard(select([['original', 'Original'], ['9:16', 'Portrait 9:16'], ['16:9', 'Landscape 16:9'], ['1:1', 'Square 1:1']]));
@@ -305,20 +383,37 @@ export function mountTranscriptEditor(options: TranscriptEditorOptions): () => v
   });
   workspace.append(tabs, ...panels.values()); activate('Sequence');
   body.append(preview, workspace);
-  dialog.append(header, statusBar, body); container.append(launcher, dialog);
+  dialog.append(header, statusBar, shortcutHelp, body); container.append(launcher, dialog);
   listen(dialog, 'close', () => { pause(); if (loaded && !busy) flushCaptionDrafts(); });
   listen(dialog, 'keydown', event => {
     const key = event as KeyboardEvent;
-    if (!(key.ctrlKey || key.metaKey) || key.key.toLowerCase() !== 'z' || (key.target instanceof HTMLInputElement || key.target instanceof HTMLTextAreaElement)) return;
-    key.preventDefault(); (key.shiftKey ? redoButton : undoButton).click();
+    if (key.defaultPrevented || key.isComposing || key.repeat || disposed || !dialog.open || !loaded || busy) return;
+    const target = key.target instanceof HTMLElement ? key.target : null;
+    // Keep native typing, select/range arrows, text undo and contenteditable behavior intact.
+    const field = target?.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])');
+    if (field && !(field instanceof HTMLInputElement && ['checkbox', 'radio', 'button', 'submit', 'reset'].includes(field.type))) return;
+    const name = key.key.toLowerCase(), modifier = key.ctrlKey || key.metaKey;
+    if (key.altKey) return;
+    if (modifier && name === 'z') { key.preventDefault(); (key.shiftKey ? redoButton : undoButton).click(); }
+    else if (modifier && name === 'y') { key.preventDefault(); redoButton.click(); }
+    else if ((modifier && name === 'f') || (!modifier && name === '/')) { key.preventDefault(); activate('Transcript'); transcriptSearch.focus(); transcriptSearch.select(); }
+    else if (!modifier && name === '?') { key.preventDefault(); shortcutHelp.open = !shortcutHelp.open; }
+    else if (!modifier && (name === 'k' || name === ' ' && !target?.closest('button, a, summary, input, [role="button"]'))) {
+      if (!options.sourceUrl || !previewRanges.length) return;
+      key.preventDefault(); togglePlayback();
+    } else if (!modifier && (name === 'j' || name === 'l')) {
+      if (!options.sourceUrl || !previewRanges.length) return;
+      key.preventDefault(); seekPreview(name === 'j' ? -5 : 5);
+    } else if (!modifier && name === 'delete' && !sequencePanel.hidden && selected.size) { key.preventDefault(); removeSelectedButton.click(); }
   });
 
   const sequencePanel = panels.get('Sequence')!;
   const sequenceSummary = el('p', 'te-muted');
   const sequenceActions = el('div', 'te-actions');
+  const removeSelectedButton = button('Remove selected', () => apply({ type: 'remove', range_ids: [...selected] }, 'Selected ranges removed. Undo is available.'), () => !!selected.size);
   sequenceActions.append(button('Select all', () => { editDocument.ranges.forEach(range => selected.add(range.id)); renderRanges(); refreshControls(); }),
     button('Clear selection', () => { selected.clear(); renderRanges(); refreshControls(); }),
-    button('Remove selected', () => apply({ type: 'remove', range_ids: [...selected] }, 'Selected ranges removed. Undo is available.'), () => !!selected.size),
+    removeSelectedButton,
     button('Keep only selected', () => apply({ type: 'keep', range_ids: [...selected] }, 'Only the selected ranges remain.'), () => !!selected.size),
     button('Combine selected', () => apply({ type: 'combine', range_ids: editDocument.ranges.filter(range => selected.has(range.id)).map(range => range.id) }, 'Consecutive ranges combined into one export clip.'), () => selected.size > 1),
     button('Restore all source clips', () => {
@@ -328,6 +423,22 @@ export function mountTranscriptEditor(options: TranscriptEditorOptions): () => v
   const rangeList = el('div', 'te-list'); rangeList.setAttribute('aria-label', 'Ordered source ranges');
   sequencePanel.append(sequenceSummary, sequenceActions, el('p', 'te-muted', 'Select consecutive ranges to combine them. Combining preserves cuts and groups them into one individual export.'), rangeList);
   const transcriptPanel = panels.get('Transcript')!;
+  const searchBox = el('div', 'te-search'); searchBox.setAttribute('role', 'search'); searchBox.setAttribute('aria-label', 'Search source transcript');
+  const transcriptSearch = guard(input('', 'search')); transcriptSearch.placeholder = 'Find a word or phrase'; transcriptSearch.maxLength = 500;
+  transcriptSearch.setAttribute('aria-label', 'Search transcript');
+  const searchCount = el('output', 'te-search-count te-muted', 'Enter a word or phrase.'); searchCount.id = `${tabId}-search-count`;
+  searchCount.setAttribute('aria-live', 'polite'); searchCount.setAttribute('aria-atomic', 'true'); transcriptSearch.setAttribute('aria-describedby', searchCount.id);
+  const searchActions = el('div', 'te-actions');
+  searchActions.append(button('Previous match', () => navigateMatch(-1), () => !!searchMatches.length), button('Next match', () => navigateMatch(1), () => !!searchMatches.length),
+    button('Clear search', () => { transcriptSearch.value = ''; updateSearch(true); transcriptSearch.focus(); }, () => !!transcriptSearch.value));
+  searchBox.append(field('Search transcript', transcriptSearch), searchCount, searchActions);
+  listen(transcriptSearch, 'input', () => { if (loaded && !busy) updateSearch(true, true); });
+  listen(transcriptSearch, 'keydown', event => {
+    const key = event as KeyboardEvent;
+    if (key.isComposing || !loaded || busy || disposed || !dialog.open || key.ctrlKey || key.metaKey || key.altKey) return;
+    if (key.key === 'Enter') { key.preventDefault(); if (!key.repeat) navigateMatch(key.shiftKey ? -1 : 1); }
+    else if (key.key === 'Escape' && transcriptSearch.value) { key.preventDefault(); key.stopPropagation(); transcriptSearch.value = ''; updateSearch(true); }
+  });
   const passageControls = el('div', 'te-passage-controls');
   const passageStart = guard(input('0')), passageEnd = guard(input('0'));
   const passageValid = () => Number(passageStart.value) >= 0 && Number(passageEnd.value) > Number(passageStart.value) && Number(passageEnd.value) <= editDocument.source_duration;
@@ -336,7 +447,7 @@ export function mountTranscriptEditor(options: TranscriptEditorOptions): () => v
     button('Remove passage', () => passageAction('remove'), passageValid), button('Keep only passage', () => passageAction('keep'), passageValid));
   [passageStart, passageEnd].forEach(node => listen(node, 'input', refreshControls));
   const transcriptList = el('div', 'te-list');
-  transcriptPanel.append(el('p', 'te-muted', 'Click a sentence or aligned word to select a source passage. Shift-click extends it. Removing cuts the video; source text is never overwritten. Previously removed footage is restored with Undo, not Keep.'), passageControls, transcriptList);
+  transcriptPanel.append(searchBox, el('p', 'te-muted', 'Search covers the full source, including removed passages. Matches select a passage and seek the paused preview. Click a sentence or aligned word to select a source passage. Shift-click extends it. Removing cuts the video; source text is never overwritten. Previously removed footage is restored with Undo, not Keep.'), passageControls, transcriptList);
   const captionsPanel = panels.get('Captions')!;
   const captionList = el('div', 'te-list');
   captionsPanel.append(el('p', 'te-muted', 'Correct caption text without changing the source transcript. Empty text hides a cue. Captions are automatically cut and retimed to the final sequence on export.'), captionList);
@@ -400,25 +511,67 @@ export function mountTranscriptEditor(options: TranscriptEditorOptions): () => v
     transcriptList.querySelectorAll<HTMLElement>('.te-word').forEach(node => node.classList.toggle('te-word-selected', Number(node.dataset.start) < Number(passageEnd.value) && Number(node.dataset.end) > Number(passageStart.value)));
     refreshControls();
   }
+  function highlightSearch(node: HTMLElement, text: string, pattern: RegExp | null) {
+    node.replaceChildren();
+    let end = 0;
+    if (pattern) for (const match of text.matchAll(pattern)) {
+      const start = match.index!;
+      node.append(document.createTextNode(text.slice(end, start)), el('mark', 'te-search-highlight', match[0]));
+      end = start + match[0].length;
+    }
+    node.append(document.createTextNode(text.slice(end)));
+  }
+  function renderSearchMatches() {
+    searchCount.textContent = !transcriptSearch.value.trim() ? 'Enter a word or phrase.' : !searchMatches.length ? 'No matching passages.' :
+      `${activeMatch + 1} of ${searchMatches.length} matching passage${searchMatches.length === 1 ? '' : 's'}`;
+    const matches = new Set(searchMatches), pattern = searchPattern(transcriptSearch.value);
+    transcriptCards.forEach((card, index) => {
+      const active = index === searchMatches[activeMatch];
+      card.classList.toggle('te-search-match', matches.has(index)); card.classList.toggle('te-search-active', active);
+      if (active) card.setAttribute('aria-current', 'true'); else card.removeAttribute('aria-current');
+      card.querySelectorAll<HTMLElement>('[data-search-text]').forEach(node => highlightSearch(node, node.dataset.searchText!, pattern));
+    });
+  }
+  function visitMatch() {
+    const index = searchMatches[activeMatch], cue = transcript[index];
+    if (!cue) return;
+    pause(); choosePassage(cue, false);
+    if (options.sourceUrl) { previewRanges = [{ start: cue.start, end: cue.end }]; previewIndex = 0; video.currentTime = cue.start; syncPlayback(); }
+    transcriptCards[index]?.scrollIntoView?.({ block: 'nearest' });
+  }
+  function updateSearch(reset = false, seekToMatch = false) {
+    const previous = reset ? undefined : searchMatches[activeMatch];
+    searchMatches = findTranscriptMatches(transcript, transcriptSearch.value);
+    activeMatch = previous === undefined ? -1 : searchMatches.indexOf(previous);
+    if (activeMatch < 0 && searchMatches.length) activeMatch = 0;
+    renderSearchMatches();
+    if (seekToMatch) visitMatch();
+    refreshControls();
+  }
+  function navigateMatch(direction: number) {
+    if (!searchMatches.length) return;
+    activeMatch = (activeMatch + direction + searchMatches.length) % searchMatches.length;
+    renderSearchMatches(); visitMatch();
+  }
   function renderTranscript() {
-    transcriptList.replaceChildren();
+    transcriptList.replaceChildren(); transcriptCards.length = 0;
     if (!transcript.length) transcriptList.append(el('p', 'te-empty', 'No source transcript is available. Use the sequence controls to edit source ranges.'));
     transcript.forEach(cue => {
       const retained = editDocument.ranges.some(range => range.start < cue.end && range.end > cue.start);
-      const card = el('article', `te-transcript-cue${retained ? '' : ' te-removed'}`);
+      const card = el('article', `te-transcript-cue${retained ? '' : ' te-removed'}`); transcriptCards.push(card);
       const sentence = button(`${time(cue.start)}–${time(cue.end)}${retained ? '' : ' · Removed'}`, () => {}, () => true, 'te-cue-time');
       listen(sentence, 'click', event => choosePassage(cue, (event as MouseEvent).shiftKey));
       const words = el('p', 'te-words');
       if (cue.words.length) cue.words.forEach(word => {
         const node = button(word.word, () => {}, () => true, 'te-word'); node.setAttribute('aria-label', `${word.word}, ${time(word.start)} to ${time(word.end)}`);
-        node.dataset.start = String(word.start); node.dataset.end = String(word.end);
+        node.dataset.start = String(word.start); node.dataset.end = String(word.end); node.dataset.searchText = word.word;
         node.classList.toggle('te-word-selected', word.start < Number(passageEnd.value) && word.end > Number(passageStart.value));
         listen(node, 'click', event => choosePassage(word, (event as MouseEvent).shiftKey)); words.append(node, document.createTextNode(' '));
       });
-      else { const node = button(cue.text, () => {}, () => true, 'te-sentence'); listen(node, 'click', event => choosePassage(cue, (event as MouseEvent).shiftKey)); words.append(node); }
+      else { const node = button(cue.text, () => {}, () => true, 'te-sentence'); node.dataset.searchText = cue.text; listen(node, 'click', event => choosePassage(cue, (event as MouseEvent).shiftKey)); words.append(node); }
       card.append(sentence, words); transcriptList.append(card);
     });
-    dropDetachedControls();
+    dropDetachedControls(); updateSearch();
   }
   function flushCaptionDrafts() {
     if (!loaded || busy) return;
@@ -478,6 +631,7 @@ export function mountTranscriptEditor(options: TranscriptEditorOptions): () => v
     captionPreview.style.fontFamily = settings.caption_style.font_family; captionPreview.style.fontSize = `${settings.caption_style.font_size / 1080 * 100}cqw`;
     captionPreview.style.color = settings.caption_style.font_color; captionPreview.style.webkitTextStroke = `${settings.caption_style.outline_width / 1080 * 100}cqw ${settings.caption_style.outline_color}`;
     captionPreview.dataset.position = settings.caption_style.position; syncPlayback();
+    presetButtons.forEach((node, index) => node.setAttribute('aria-pressed', String(JSON.stringify(settings) === JSON.stringify(exportPresets[index].settings))));
   }
   function render() { renderRanges(); renderTranscript(); renderCaptions(); renderCandidates(); renderCleanup(); renderSettings(); refreshControls(); launchStatus.textContent = `${editDocument.ranges.length} ranges · ${time(total(editDocument.ranges))}`; }
 
