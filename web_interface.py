@@ -9,14 +9,18 @@ import json
 import subprocess
 import tempfile
 import threading
+from contextvars import ContextVar
+from functools import wraps
+from pathlib import Path
 from uuid import uuid4
 from datetime import datetime
-from flask import Flask, request, jsonify, send_file, send_from_directory, Response
+from flask import Flask, request, jsonify, send_file, send_from_directory, Response, g
 from flask_cors import CORS
 from moviepy import VideoFileClip, concatenate_videoclips
 from werkzeug.utils import secure_filename
 from subtitle_serializer import serialize_subtitles, NoCaptions
 from transcript_store import invalidate_transcript, read_current_transcript
+from project_store import ProjectStore, ProjectConflict
 from source_preview import SOURCE_LOCK, UNAVAILABLE as SOURCE_UNAVAILABLE, invalidate_source, publish_source, resolve_source
 
 # Safe to import at module level: scoring.py only touches heavy/optional
@@ -69,6 +73,22 @@ except Exception as e:
     print(f"ERROR: Could not create upload folder: {e}")
     print(f"ERROR: Attempted path: {os.path.abspath(UPLOAD_FOLDER)}")
 
+# Workspace context is isolated per HTTP request and explicitly inherited by
+# admitted background workers. Legacy routes retain their original disk layout.
+projects = ProjectStore(DATA_DIR)
+_current_project = ContextVar('hi_lite_project', default=None)
+_owner_projects = {}
+_task_projects = {}
+
+
+def workspace_paths():
+    project_id = _current_project.get()
+    if project_id:
+        return projects.paths(project_id)
+    return {key: globals()[key] for key in (
+        'MANIFEST_DIR', 'SEGMENTS_DIR', 'SEGMENTS_JSON', 'HIGHLIGHTS_DIR', 'SCORED_SEGMENTS', 'UPLOAD_FOLDER')}
+
+
 # Track processing status
 processing_status = {}
 
@@ -86,6 +106,7 @@ def acquire_workspace():
         if _workspace_owner is not None:
             return None
         _workspace_owner = object()
+        _owner_projects[_workspace_owner] = _current_project.get()
         return _workspace_owner
     finally:
         _admission_mutex.release()
@@ -95,6 +116,7 @@ def release_workspace(owner):
     global _workspace_owner
     with _admission_mutex:
         if _workspace_owner is owner:
+            _owner_projects.pop(owner, None)
             _workspace_owner = None
 
 
@@ -107,12 +129,15 @@ def workspace_busy():
 
 def run_workspace_job(owner, task_id, worker, worker_args):
     """Keep admission until either of the existing workers has returned."""
+    token = _current_project.set(_owner_projects.get(owner))
+    _task_projects[task_id] = _current_project.get()
     try:
         worker(*worker_args)
     except Exception as e:
         app.logger.exception("Workspace job failed")
         processing_status[task_id] = {"status": "error", "message": f"Processing failed: {e}"}
     finally:
+        _current_project.reset(token)
         release_workspace(owner)
 
 # Active pipeline subprocess, so the parent watchdog can kill it on shutdown
@@ -171,6 +196,10 @@ def resource_path(relative_path):
 # Serve segments manifest JSON
 @app.route("/data/segments_manifest.json")
 def get_segments_json():
+    _paths = workspace_paths()
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
+    SEGMENTS_JSON = _paths['SEGMENTS_JSON']
+    UPLOAD_FOLDER = _paths['UPLOAD_FOLDER']
     if not os.path.exists(SEGMENTS_JSON):
         # Return empty segments list so the app shows the styled upload screen
         return jsonify({"segments": []}), 200
@@ -195,6 +224,9 @@ def get_segments_json():
 def serve_source(source_id):
     # Opening the validated, uniquely named upload happens under the same lock
     # as replacement invalidation. Flask handles conditional HTTP byte ranges.
+    _paths = workspace_paths()
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
+    UPLOAD_FOLDER = _paths['UPLOAD_FOLDER']
     with SOURCE_LOCK:
         try:
             path, _ = resolve_source(MANIFEST_DIR, UPLOAD_FOLDER, source_id)
@@ -207,6 +239,8 @@ def serve_source(source_id):
 # Serve individual video segments
 @app.route("/segments/<filename>")
 def serve_segment(filename):
+    _paths = workspace_paths()
+    SEGMENTS_DIR = _paths['SEGMENTS_DIR']
     if not os.path.exists(os.path.join(SEGMENTS_DIR, filename)):
         return jsonify({"status": "error", "message": f"{filename} not found"}), 404
     return send_from_directory(SEGMENTS_DIR, filename)
@@ -214,6 +248,8 @@ def serve_segment(filename):
 # Serve final highlight reel
 @app.route("/final/<filename>")
 def serve_final(filename):
+    _paths = workspace_paths()
+    HIGHLIGHTS_DIR = _paths['HIGHLIGHTS_DIR']
     if not os.path.exists(os.path.join(HIGHLIGHTS_DIR, filename)):
         return jsonify({"status": "error", "message": f"{filename} not found"}), 404
     return send_from_directory(HIGHLIGHTS_DIR, filename)
@@ -221,6 +257,10 @@ def serve_final(filename):
 # Receive selected segments and generate highlight reel
 @app.route("/api/export", methods=["POST"])
 def export_segments():
+    _paths = workspace_paths()
+    HIGHLIGHTS_DIR = _paths['HIGHLIGHTS_DIR']
+    SEGMENTS_DIR = _paths['SEGMENTS_DIR']
+    SEGMENTS_JSON = _paths['SEGMENTS_JSON']
     owner = acquire_workspace()
     if owner is None:
         return workspace_busy()
@@ -273,6 +313,9 @@ def process_video_async(video_path, output_folder, task_id):
     """
     Process video by calling main.py as a subprocess.
     """
+    _paths = workspace_paths()
+    SEGMENTS_JSON = _paths['SEGMENTS_JSON']
+    UPLOAD_FOLDER = _paths['UPLOAD_FOLDER']
     global processing_status, active_pipeline_process
     process = None
 
@@ -543,6 +586,8 @@ def subtitle_cache_policy(response):
 @app.route("/api/subtitles", defaults={"format": None})
 @app.route("/api/subtitles/<format>")
 def subtitles(format):
+    _paths = workspace_paths()
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
     if format is not None and format not in ("srt", "vtt"):
         return jsonify(message="Unsupported subtitle format. Use srt or vtt."), 400
     owner = acquire_workspace()
@@ -573,6 +618,10 @@ def upload_video():
     """
     Handle video upload and start processing
     """
+    _paths = workspace_paths()
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
+    SEGMENTS_JSON = _paths['SEGMENTS_JSON']
+    UPLOAD_FOLDER = _paths['UPLOAD_FOLDER']
     owner = None
     worker_started = False
     try:
@@ -593,6 +642,9 @@ def upload_video():
         owner = acquire_workspace()
         if owner is None:
             return workspace_busy()
+
+        if _current_project.get() and os.path.exists(SEGMENTS_JSON):
+            return jsonify(status="error", message="This project already contains a recording. Create a new project to import another."), 409
 
         # Fail closed before any replacement work, including upload/worker failures.
         with SOURCE_LOCK:
@@ -620,6 +672,7 @@ def upload_video():
         # Save uploaded file
         filename = secure_filename(file.filename)
         task_id = f"task_{uuid4().hex}"
+        _task_projects[task_id] = _current_project.get()
         unique_filename = f"{task_id.removeprefix('task_')}_{filename}"
         video_path = os.path.join(upload_path, unique_filename)
         
@@ -749,6 +802,8 @@ def upload_video():
 
 @app.route("/api/processing-status/<task_id>", methods=["GET"])
 def get_processing_status(task_id):
+    if _current_project.get() and _task_projects.get(task_id) != _current_project.get():
+        return jsonify(status="error", message="Task not found in this project."), 404
     """
     Check processing status for a task
     """
@@ -771,6 +826,8 @@ def get_available_videos():
     """
     List all processed videos available for viewing
     """
+    _paths = workspace_paths()
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
     highlights_dir = MANIFEST_DIR
     videos = []
     
@@ -799,6 +856,8 @@ def get_available_videos():
 # Update the segments manifest endpoint to support different videos
 @app.route("/data/<video_id>/segments_manifest.json")
 def get_video_segments_json(video_id):
+    _paths = workspace_paths()
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
     manifest_path = os.path.join(MANIFEST_DIR, video_id, "segments_manifest.json")
     if not os.path.exists(manifest_path):
         return jsonify({"status": "error", "message": "Manifest not found"}), 404
@@ -811,6 +870,8 @@ def get_video_segments_json(video_id):
 # Update segments serving to support different videos
 @app.route("/segments/<video_id>/<filename>")
 def serve_video_segment(video_id, filename):
+    _paths = workspace_paths()
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
     segments_path = os.path.join(MANIFEST_DIR, video_id, "segments", filename)
     if not os.path.exists(segments_path):
         return jsonify({"status": "error", "message": "Segment not found"}), 404
@@ -841,6 +902,8 @@ def automatic_export_segments(manifest):
 
 def current_scoring_segments():
     """The scoring transcript is authoritative; the clip manifest is only for export."""
+    _paths = workspace_paths()
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
     try:
         with open(os.path.join(MANIFEST_DIR, "transcription.json"), "r", encoding="utf-8") as f:
             transcript = json.load(f)
@@ -868,6 +931,8 @@ def run_scoring_subprocess(task_id, instructions, settings=None, backend_name=No
     scored_segments.json + sorted_segments.json into the highlights folder.
     Returns True on success.
     """
+    _paths = workspace_paths()
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
     global active_pipeline_process
 
     transcript_path = os.path.join(MANIFEST_DIR, "transcription.json")
@@ -950,6 +1015,11 @@ def build_highlight_reel(min_score, sort_chronological, instructions, highlights
     Returns the success payload dict; raises ValueError with a user-facing
     message on expected failures.
     """
+    _paths = workspace_paths()
+    HIGHLIGHTS_DIR = _paths['HIGHLIGHTS_DIR']
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
+    SEGMENTS_DIR = _paths['SEGMENTS_DIR']
+    SEGMENTS_JSON = _paths['SEGMENTS_JSON']
     scored_segments_path = os.path.join(MANIFEST_DIR, "sorted_segments.json")
     print(f"DEBUG: Looking for sorted_segments.json at: {scored_segments_path}")
 
@@ -1103,6 +1173,8 @@ def auto_generate_async(task_id, min_score, sort_chronological, instructions, re
     Background task: optionally (re)run AI scoring, then build the reel.
     Progress/results land in processing_status[task_id] for the UI to poll.
     """
+    _paths = workspace_paths()
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
     try:
         segments = current_scoring_segments()
         settings = llm_scoring.get_llm_settings()
@@ -1178,6 +1250,7 @@ def auto_export_highlights():
     worker_started = False
     try:
         task_id = f"autogen_{uuid4().hex}"
+        _task_projects[task_id] = _current_project.get()
         processing_status[task_id] = {
             "status": "processing", "stage": "starting", "progress": 0,
             "message": "Starting auto-generation..."
@@ -1335,6 +1408,9 @@ def discard_reel():
     Expects {"output_file": "/final/<name>.mp4"} (as returned by the
     export/auto-generate endpoints).
     """
+    _paths = workspace_paths()
+    HIGHLIGHTS_DIR = _paths['HIGHLIGHTS_DIR']
+    SEGMENTS_DIR = _paths['SEGMENTS_DIR']
     owner = acquire_workspace()
     if owner is None:
         return workspace_busy()
@@ -1379,6 +1455,9 @@ def preview_auto_export():
     Preview what will be included in auto-generated highlight reel
     Returns count and estimated duration without actually creating the video
     """
+    _paths = workspace_paths()
+    SEGMENTS_DIR = _paths['SEGMENTS_DIR']
+    SEGMENTS_JSON = _paths['SEGMENTS_JSON']
     data = request.json or {}
     min_score = data.get("min_score", 7)
     
@@ -1477,6 +1556,71 @@ def preview_auto_export():
         "estimated_duration_seconds": round(total_duration, 1),
         "min_score": min_score
     })
+
+
+@app.route('/api/projects', methods=['GET', 'POST'])
+def project_index():
+    try:
+        if request.method == 'GET':
+            return jsonify(projects=projects.list())
+        data = request.get_json(silent=True) or {}
+        return jsonify(projects.create(data.get('name', 'Untitled project'))), 201
+    except (ValueError, OSError) as error:
+        return jsonify(status='error', message=str(error)), 400
+
+
+@app.route('/api/projects/<project_id>', methods=['GET', 'PUT'])
+def project_detail(project_id):
+    try:
+        if request.method == 'GET':
+            return jsonify(projects.get(project_id))
+        data = request.get_json(silent=True) or {}
+        return jsonify(projects.save(project_id, data.get('revision'), data.get('state'), data.get('name')))
+    except ProjectConflict as error:
+        return jsonify(status='error', message=str(error)), 409
+    except FileNotFoundError as error:
+        return jsonify(status='error', message=str(error)), 404
+    except (ValueError, OSError) as error:
+        return jsonify(status='error', message=str(error)), 400
+
+
+def project_route(view):
+    @wraps(view)
+    def scoped(project_id, **kwargs):
+        try:
+            projects.get(project_id)
+        except FileNotFoundError as error:
+            return jsonify(status='error', message=str(error)), 404
+        except (ValueError, OSError) as error:
+            return jsonify(status='error', message=str(error)), 400
+        token = _current_project.set(project_id)
+        try:
+            response = app.make_response(view(**kwargs))
+            if response.is_json:
+                def scope(value):
+                    if isinstance(value, dict):
+                        return {key: scope(item) for key, item in value.items()}
+                    if isinstance(value, list):
+                        return [scope(item) for item in value]
+                    if isinstance(value, str) and value.startswith(('/api/source/', '/segments/', '/final/')):
+                        return f'/api/projects/{project_id}' + value
+                    return value
+                response.set_data(app.json.dumps(scope(response.get_json())))
+            response.headers['Cache-Control'] = 'no-store'
+            return response
+        finally:
+            _current_project.reset(token)
+    return scoped
+
+
+# Explicit aliases preserve existing legacy clients without changing global paths.
+_project_views = {}
+for _rule in list(app.url_map.iter_rules()):
+    if _rule.rule.startswith(('/data/', '/segments/', '/final/', '/api/')) and not _rule.rule.startswith(('/api/projects', '/api/llm-')):
+        app.add_url_rule('/api/projects/<project_id>' + _rule.rule,
+                         endpoint='project_' + _rule.endpoint,
+                         view_func=_project_views.setdefault(_rule.endpoint, project_route(app.view_functions[_rule.endpoint])),
+                         methods=_rule.methods, defaults=_rule.defaults)
 
 
 @app.route('/', defaults={'path': ''})
