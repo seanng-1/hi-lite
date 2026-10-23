@@ -17,6 +17,10 @@ are reaped on failure/cancellation, and the destination is replaced only after
 the entire render succeeds. A threading.Event-compatible ``cancel_event`` and
 ``progress_callback(percent)`` are optional. The result includes the output
 path, dimensions, duration, and SRT/VTT strings (not public download URLs).
+The final video is resampled once onto its frame grid: fractional-frame cuts
+do not accumulate timing error. ``duration`` is the requested timeline length;
+the actual video can differ by less than one frame. Intermediate PCM audio
+avoids adding encoder priming/padding at every cut and is removed with staging.
 """
 import json
 import math
@@ -387,35 +391,50 @@ def export_source_ranges(source_path, ranges, output_path, *, captions=None, set
             _check_cancel(cancel_event)
             crop = crop_geometry(info["width"], info["height"], options["aspect_ratio"],
                                  item.get("crop", options["crop"]))
-            name = f"range-{index:05d}.mp4"
+            # PCM avoids independently encoded AAC priming/padding at every
+            # seam. Disable B frames so requested ffconcat duration overrides
+            # cannot make the intermediate video decode timestamps overlap.
+            name = f"range-{index:05d}.mkv"
             filters = (f"scale={info['width']}:{info['height']},setsar=1,"
                        f"crop={crop['width']}:{crop['height']}:{crop['x']}:{crop['y']},setpts=PTS-STARTPTS")
             command = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                        "-ss", f"{item['start']:.9f}", "-i", str(source),
                        "-t", f"{item['end'] - item['start']:.9f}", "-map", "0:v:0", "-vf", filters,
                        "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p",
-                       "-threads", "2", "-r", f"{info['fps']:.9f}"]
+                       "-bf", "0", "-threads", "2", "-r", f"{info['fps']:.9f}"]
             if info["has_audio"]:
-                command += ["-map", "0:a:0", "-af", "asetpts=PTS-STARTPTS,apad", "-c:a", "aac",
+                command += ["-map", "0:a:0", "-af", "asetpts=PTS-STARTPTS,apad", "-c:a", "pcm_s16le",
                             "-ar", "48000", "-ac", "2"]
             else:
                 command += ["-an"]
-            command += ["-map_metadata", "-1", "-movflags", "+faststart", str(stage / name)]
+            command += ["-map_metadata", "-1", str(stage / name)]
             _run_process(command, cancel_event=cancel_event)
-            parts.append(f"file '{name}'\n")
+            # An arbitrary cut (e.g. .27s at 10fps) occupies a fractional frame.
+            # Advance by the requested time, never by its encoded frame count.
+            parts.append(f"file '{name}'\nduration {item['end'] - item['start']:.9f}\n")
             if progress_callback:
                 progress_callback(round((index + 1) / len(selected) * 85))
         (stage / "ranges.txt").write_text("".join(parts), encoding="utf-8")
         total_duration = sum(item["end"] - item["start"] for item in selected)
         command = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-f", "concat",
                    "-safe", "1", "-i", "ranges.txt", "-t", f"{total_duration:.9f}"]
+        # Resample video exactly once onto the complete output frame grid.
+        # Stream-copy would retain fractional/off-grid timestamps and permit
+        # cut rounding to accumulate relative to the caption/audio timeline.
+        final_filters = f"fps={info['fps']:.9f}:round=near"
         if options["burn_captions"]:
             (stage / "captions.ass").write_text(_ass_subtitles(cues, geometry["width"], geometry["height"],
                                                                options["caption_style"]), encoding="utf-8")
-            command += ["-vf", "ass=filename=captions.ass", "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-                        "-pix_fmt", "yuv420p", "-threads", "2", "-c:a", "copy"]
+            final_filters += ",ass=filename=captions.ass"
+        command += ["-map", "0:v:0", "-vf", final_filters, "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                    "-pix_fmt", "yuv420p", "-threads", "2"]
+        if info["has_audio"]:
+            # The lossless pieces contain exactly their selected audio samples.
+            # Rebuild continuous sample timestamps rather than inheriting MKV's
+            # millisecond timebase rounding, then encode AAC only once.
+            command += ["-map", "0:a:0", "-af", "asetpts=N/SR/TB,apad", "-c:a", "aac", "-ar", "48000", "-ac", "2"]
         else:
-            command += ["-c", "copy"]
+            command += ["-an"]
         command += ["-movflags", "+faststart", "complete.mp4"]
         _run_process(command, cancel_event=cancel_event, cwd=str(stage))
         completed = stage / "complete.mp4"

@@ -277,6 +277,41 @@ class RealMediaExport(unittest.TestCase):
         self.assertIn("Edited captions", result["subtitles"]["vtt"])
         self.assertFalse(editor.probe_source(output)["has_audio"])
 
+    def test_off_frame_cuts_do_not_accumulate_video_caption_or_audio_drift(self):
+        # Individual .27s/2.25s cuts are not whole frames at either source FPS.
+        # Twenty independent encodes must not make the twentieth seam drift by
+        # twenty rounding errors relative to the source-time caption timeline.
+        for fps in (10, 30):
+            source = Path(self.folder.name, f"arbitrary-source-{fps}.mp4")
+            colors = f"color=c=red:s=160x90:r={fps},drawbox=c=blue:t=fill:enable='gte(t,3)'"
+            subprocess.run([editor.FFMPEG, "-v", "error", "-y", "-f", "lavfi", "-i", colors,
+                            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "6",
+                            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-threads", "1", "-c:a", "aac", str(source)], check=True)
+            for duration in (.27, 2.25):
+                with self.subTest(fps=fps, duration=duration):
+                    ranges = [{"start": (index % 2) * 3, "end": (index % 2) * 3 + duration}
+                              for index in range(20)]
+                    captions = [{"start": 0, "end": 3, "text": "red"}, {"start": 3, "end": 6, "text": "blue"}]
+                    output = Path(self.folder.name, f"arbitrary-{fps}-{duration}.mp4")
+                    result = editor.export_source_ranges(source, ranges, output, captions=captions)
+                    frame = subprocess.check_output([editor.FFMPEG, "-v", "error", "-i", str(output),
+                        "-vf", "scale=1:1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+                    colors = ["red" if frame[index] > frame[index + 2] else "blue" for index in range(0, len(frame), 3)]
+                    transitions = [index / fps for index, color in enumerate(colors) if index and color != colors[index - 1]]
+                    self.assertEqual(len(transitions), 19)
+                    for index, actual in enumerate(transitions, 1):
+                        self.assertLess(abs(actual - index * duration), 1 / fps,
+                                        f"Seam {index} shifted: {actual} versus {index * duration}")
+                    expected = 20 * duration
+                    self.assertLess(abs(editor.probe_source(output)["duration"] - expected), 1 / fps)
+                    remapped = editor.remap_captions(captions, ranges)
+                    self.assertEqual(len(remapped), 20)
+                    self.assertAlmostEqual(remapped[-1]["end"], expected, places=6)
+                    self.assertEqual(result["duration"], expected)
+                    audio = subprocess.check_output([editor.FFMPEG, "-v", "error", "-i", str(output),
+                        "-map", "0:a:0", "-ac", "1", "-ar", "48000", "-f", "s16le", "-"])
+                    self.assertLess(abs(len(audio) / (2 * 48000) - expected), 1 / fps)
+
 
 if __name__ == "__main__":
     unittest.main()
