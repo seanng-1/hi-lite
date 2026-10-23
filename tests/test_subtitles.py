@@ -157,7 +157,7 @@ class Downloads(unittest.TestCase):
         with patch.object(pipeline, 'extract_audio'), \
              patch.object(pipeline, 'transcribe_audio', return_value={'segments': [cue(text='B')]}), \
              patch.object(pipeline, 'export_segments_to_excel'), \
-             patch.object(pipeline, 'extract_all_segments', return_value=[]):
+             patch.object(pipeline, 'build_segment_metadata', return_value=[]):
             self.publish('A')
             pipeline.main(str(source), str(self.folder))
             # Valid publication survives a later clip/manifest failure.
