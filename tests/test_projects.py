@@ -110,6 +110,14 @@ class Projects(unittest.TestCase):
         with patch('project_store._atomic_write', side_effect=OSError('disk full')):
             with self.assertRaises(OSError): self.store.restore_checkpoint(project['id'], checkpoint['id'], 0)
         self.assertEqual(self.store.get(project['id'])['revision'], 0)
+        from transcript_store import _atomic_write
+        def fail_project_write(path, data):
+            if path.name == 'project.json': raise OSError('disk full after recovery')
+            return _atomic_write(path, data)
+        with patch('project_store._atomic_write', side_effect=fail_project_write):
+            with self.assertRaises(OSError): self.store.restore_checkpoint(project['id'], checkpoint['id'], 0)
+        self.assertEqual(self.store.get(project['id'])['revision'], 0)
+        self.assertEqual(len(self.store.list_checkpoints(project['id'])), 2)
         other = self.store.create('Symlink')
         (self.store.directory(other['id']) / 'checkpoints').symlink_to(folder, target_is_directory=True)
         with self.assertRaises(ValueError): self.store.list_checkpoints(other['id'])
