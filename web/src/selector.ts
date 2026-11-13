@@ -610,7 +610,6 @@ interface Segment {
       const manifest = await response.json();
       segments = readSegments(manifest);
       source = readSource(manifest, projects.prefix);
-      if (projects.active) projects.active.has_media = true;
     } catch (err) {
       const message = err instanceof Error && !(err instanceof SyntaxError)
         ? err.message : "The recording manifest could not be read. It may contain invalid JSON.";
@@ -622,6 +621,7 @@ interface Segment {
       showUploadInterface();
       return;
     }
+    if (projects.active) projects.active.has_media = true;
     
     // Build main UI
     buildMainUI(segments, currentVideoId, recordingName, source);
