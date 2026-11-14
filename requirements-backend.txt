@@ -5,6 +5,11 @@ flask_cors
 moviepy
 requests
 faster-whisper
+# faster-whisper 1.2.1 calls av.open(..., metadata_errors=...), which PyAV 19
+# removed; with av>=19 every transcription fails with a TypeError. Its own
+# requirement is an unbounded av>=11, so cap it here until faster-whisper
+# ships a compatible release.
+av>=11,<19
 pandas
 openpyxl
 python-dotenv
