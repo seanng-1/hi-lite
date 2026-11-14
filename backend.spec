@@ -20,6 +20,9 @@ hiddenimports = [
     # Pipeline modules invoked via `backend.exe --process-video`
     'main', 'video_processor', 'transcription_client',
     'local_transcriber', 'highlight_analyzer',
+    'source_preview',
+    # Project and editor modules imported by web_interface
+    'project_store', 'edit_model', 'editor_api', 'media_editor', 'desktop_sources',
     # AI scoring invoked via `backend.exe --score-highlights`
     'model_based_processing', 'model_based_processing.scoring',
 ]
