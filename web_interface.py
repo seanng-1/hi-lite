@@ -9,11 +9,20 @@ import json
 import subprocess
 import tempfile
 import threading
+import signal
+from contextvars import ContextVar
+from functools import wraps
+from pathlib import Path
+from uuid import uuid4
 from datetime import datetime
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_file, send_from_directory, Response, g
 from flask_cors import CORS
 from moviepy import VideoFileClip, concatenate_videoclips
 from werkzeug.utils import secure_filename
+from subtitle_serializer import serialize_subtitles, NoCaptions
+from transcript_store import invalidate_transcript, read_current_transcript, _atomic_write
+from project_store import ProjectStore, ProjectConflict
+from source_preview import SOURCE_LOCK, UNAVAILABLE as SOURCE_UNAVAILABLE, invalidate_source, publish_source, resolve_source
 
 # Safe to import at module level: scoring.py only touches heavy/optional
 # deps (requests session, g4f) lazily inside the backends.
@@ -65,11 +74,166 @@ except Exception as e:
     print(f"ERROR: Could not create upload folder: {e}")
     print(f"ERROR: Attempted path: {os.path.abspath(UPLOAD_FOLDER)}")
 
+# Workspace context is isolated per HTTP request and explicitly inherited by
+# admitted background workers. Legacy routes retain their original disk layout.
+projects = ProjectStore(DATA_DIR)
+_current_project = ContextVar('hi_lite_project', default=None)
+_owner_projects = {}
+_task_projects = {}
+_cancel_events = {}
+_active_task = None
+_server_instance = uuid4().hex
+
+
+def workspace_paths():
+    project_id = _current_project.get()
+    if project_id:
+        return projects.paths(project_id)
+    return {key: globals()[key] for key in (
+        'MANIFEST_DIR', 'SEGMENTS_DIR', 'SEGMENTS_JSON', 'HIGHLIGHTS_DIR', 'SCORED_SEGMENTS', 'UPLOAD_FOLDER')}
+
+
+def persist_job(task_id):
+    """Keep terminal results and interrupted-import recovery across restarts."""
+    try:
+        folder = Path(workspace_paths()['MANIFEST_DIR'])
+        jobs = folder / 'jobs'
+        jobs.mkdir(parents=True, exist_ok=True)
+        record = {'task_id': task_id, 'project_id': _current_project.get(), 'server_instance': _server_instance,
+                  'result': processing_status.get(task_id, {})}
+        content = json.dumps(record, ensure_ascii=False).encode('utf-8')
+        _atomic_write(jobs / (task_id + '.json'), content)
+        if task_id.startswith('task_'):
+            _atomic_write(folder / 'import-status.json', content)
+    except (OSError, ValueError):
+        # A full/unwritable disk cannot leak admission or hide the original error.
+        app.logger.exception('Could not persist background job status')
+
+
+def read_persisted_job(task_id):
+    if not re.fullmatch(r'(?:task|autogen|render|candidates)_[a-f0-9]{32}', task_id):
+        return None
+    try:
+        record = json.loads(Path(workspace_paths()['MANIFEST_DIR'], 'jobs', task_id + '.json').read_bytes())
+        if record.get('project_id') != _current_project.get():
+            return None
+        result = record['result']
+        if result.get('status') in ('processing', 'cancelling') and record.get('server_instance') != _server_instance:
+            return {'status': 'error', 'message': 'The app stopped before this operation finished. Retry the operation; saved edits are unchanged.'}
+        return result
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def can_import_recording():
+    paths = workspace_paths()
+    if not Path(paths['SEGMENTS_JSON']).exists():
+        return True
+    # A published original (even moved) or legacy recording is never replaced.
+    if Path(paths['MANIFEST_DIR'], 'current-source.json').exists():
+        return False
+    try:
+        record = json.loads(Path(paths['MANIFEST_DIR'], 'import-status.json').read_bytes())
+        result = record['result']
+        return (result.get('status') in ('error', 'cancelled') or
+                result.get('status') == 'processing' and record.get('server_instance') != _server_instance)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 # Track processing status
 processing_status = {}
 
+# The mutex protects only the owner token; requests never wait for a job.
+# Ownership can pass from an HTTP handler to its existing background thread.
+_admission_mutex = threading.Lock()
+_workspace_owner = None
+
+
+def acquire_workspace():
+    global _workspace_owner
+    if not _admission_mutex.acquire(blocking=False):
+        return None
+    try:
+        if _workspace_owner is not None:
+            return None
+        _workspace_owner = object()
+        _owner_projects[_workspace_owner] = _current_project.get()
+        return _workspace_owner
+    finally:
+        _admission_mutex.release()
+
+
+def release_workspace(owner):
+    global _workspace_owner
+    with _admission_mutex:
+        if _workspace_owner is owner:
+            _owner_projects.pop(owner, None)
+            _workspace_owner = None
+
+
+def workspace_busy():
+    return jsonify({
+        "status": "error",
+        "message": "Hi-Lite is busy processing another operation. Please wait for it to finish."
+    }), 409
+
+
+def run_workspace_job(owner, task_id, worker, worker_args):
+    """Keep admission until either of the existing workers has returned."""
+    global _active_task
+    token = _current_project.set(_owner_projects.get(owner))
+    _task_projects[task_id] = _current_project.get()
+    cancellation = _cancel_events.setdefault(task_id, threading.Event())
+    _active_task = task_id
+    persist_job(task_id)
+    try:
+        if not cancellation.is_set():
+            worker(*worker_args)
+    except Exception as e:
+        app.logger.exception("Workspace job failed")
+        processing_status[task_id] = {"status": "error", "message": f"Processing failed: {e}"}
+    finally:
+        if cancellation.is_set():
+            processing_status[task_id] = {"status": "cancelled", "message": "Operation cancelled. Your saved edits are unchanged."}
+        persist_job(task_id)
+        _active_task = None
+        _current_project.reset(token)
+        release_workspace(owner)
+
 # Active pipeline subprocess, so the parent watchdog can kill it on shutdown
 active_pipeline_process = None
+
+
+def terminate_pipeline_process(process):
+    """Stop the admitted subprocess tree, including its ffmpeg descendants."""
+    if process is None or process.poll() is not None:
+        return
+    if os.name == 'nt' and getattr(process, 'pid', None):
+        subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], capture_output=True)
+    elif getattr(process, 'pid', None):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    else:
+        process.kill()
+
+
+def pipeline_process_options():
+    return {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' else {'start_new_session': True}
+
+
+def finish_pipeline_process(process):
+    """Reap this direct child before admission is released, including on error."""
+    global active_pipeline_process
+    if process is not None:
+        try:
+            if process.poll() is None:
+                terminate_pipeline_process(process)
+            process.wait()
+        finally:
+            active_pipeline_process = None
 
 
 def start_parent_watchdog():
@@ -89,7 +253,7 @@ def start_parent_watchdog():
             pass
         try:
             if active_pipeline_process and active_pipeline_process.poll() is None:
-                active_pipeline_process.kill()
+                terminate_pipeline_process(active_pipeline_process)
         except Exception:
             pass
         os._exit(0)
@@ -112,17 +276,51 @@ def resource_path(relative_path):
 # Serve segments manifest JSON
 @app.route("/data/segments_manifest.json")
 def get_segments_json():
+    _paths = workspace_paths()
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
+    SEGMENTS_JSON = _paths['SEGMENTS_JSON']
+    UPLOAD_FOLDER = _paths['UPLOAD_FOLDER']
     if not os.path.exists(SEGMENTS_JSON):
         # Return empty segments list so the app shows the styled upload screen
         return jsonify({"segments": []}), 200
     
-    directory = os.path.dirname(SEGMENTS_JSON)
-    filename = os.path.basename(SEGMENTS_JSON)
-    return send_from_directory(directory, filename)
+    with SOURCE_LOCK:
+        try:
+            _, source = resolve_source(MANIFEST_DIR, UPLOAD_FOLDER)
+        except ValueError:
+            # Preserve the existing serving/validation contract for legacy or
+            # malformed manifests. The UI handles a missing source explicitly.
+            response = send_from_directory(os.path.dirname(SEGMENTS_JSON), os.path.basename(SEGMENTS_JSON))
+        else:
+            with open(SEGMENTS_JSON, encoding='utf-8') as stream:
+                manifest = json.load(stream)
+            manifest['source'] = source
+            response = jsonify(manifest)
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+
+
+@app.route('/api/source/<source_id>')
+def serve_source(source_id):
+    # Opening the validated, uniquely named upload happens under the same lock
+    # as replacement invalidation. Flask handles conditional HTTP byte ranges.
+    _paths = workspace_paths()
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
+    UPLOAD_FOLDER = _paths['UPLOAD_FOLDER']
+    with SOURCE_LOCK:
+        try:
+            path, _ = resolve_source(MANIFEST_DIR, UPLOAD_FOLDER, source_id)
+        except ValueError:
+            return jsonify(status='error', message=SOURCE_UNAVAILABLE), 404
+        response = send_file(path, conditional=True)
+        response.headers['Cache-Control'] = 'no-store'
+        return response
 
 # Serve individual video segments
 @app.route("/segments/<filename>")
 def serve_segment(filename):
+    _paths = workspace_paths()
+    SEGMENTS_DIR = _paths['SEGMENTS_DIR']
     if not os.path.exists(os.path.join(SEGMENTS_DIR, filename)):
         return jsonify({"status": "error", "message": f"{filename} not found"}), 404
     return send_from_directory(SEGMENTS_DIR, filename)
@@ -130,6 +328,8 @@ def serve_segment(filename):
 # Serve final highlight reel
 @app.route("/final/<filename>")
 def serve_final(filename):
+    _paths = workspace_paths()
+    HIGHLIGHTS_DIR = _paths['HIGHLIGHTS_DIR']
     if not os.path.exists(os.path.join(HIGHLIGHTS_DIR, filename)):
         return jsonify({"status": "error", "message": f"{filename} not found"}), 404
     return send_from_directory(HIGHLIGHTS_DIR, filename)
@@ -137,43 +337,72 @@ def serve_final(filename):
 # Receive selected segments and generate highlight reel
 @app.route("/api/export", methods=["POST"])
 def export_segments():
-    data = request.json
-    selected_ids = data.get("selected_ids", [])
+    _paths = workspace_paths()
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
+    HIGHLIGHTS_DIR = _paths['HIGHLIGHTS_DIR']
+    SEGMENTS_DIR = _paths['SEGMENTS_DIR']
+    SEGMENTS_JSON = _paths['SEGMENTS_JSON']
+    owner = acquire_workspace()
+    if owner is None:
+        return workspace_busy()
+    try:
+        data = request.json
+        selected_ids = data.get("selected_ids", [])
 
-    # Load manifest
-    if not os.path.exists(SEGMENTS_JSON):
-        return jsonify({"status": "error", "message": "segments_manifest.json not found"}), 404
-    with open(SEGMENTS_JSON, "r", encoding="utf-8") as f:
-        manifest = json.load(f)
-    segments_list = manifest.get("segments", [])
+        # Load manifest
+        if not os.path.exists(SEGMENTS_JSON):
+            return jsonify({"status": "error", "message": "segments_manifest.json not found"}), 404
+        with open(SEGMENTS_JSON, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        segments_list = manifest.get("segments", [])
 
-    # Filter selected segments
-    selected_segments = [s for s in segments_list if s["id"] in selected_ids]
+        # Filter selected segments
+        selected_segments = [s for s in segments_list if s["id"] in selected_ids]
 
-    if not selected_segments:
-        return jsonify({"status": "error", "message": "No segments selected"}), 400
+        if not selected_segments:
+            return jsonify({"status": "error", "message": "No segments selected"}), 400
 
-    clips = []
-    for seg in selected_segments:
-        video_path = os.path.join(SEGMENTS_DIR, seg["filename"])
-        if os.path.exists(video_path):
-            clips.append(VideoFileClip(video_path))
+        # Modern imports keep source-time ranges rather than pre-rendering every
+        # transcript segment. Legacy workspaces without a valid source still use
+        # their existing clips below.
+        try:
+            with SOURCE_LOCK:
+                source_path, _ = resolve_source(MANIFEST_DIR, _paths['UPLOAD_FOLDER'])
+        except ValueError:
+            source_path = None
+        if source_path is not None:
+            from media_editor import export_source_ranges
+            output_filename = f"highlight_reel_{uuid4().hex}.mp4"
+            export_source_ranges(source_path, selected_segments,
+                                 os.path.join(HIGHLIGHTS_DIR, output_filename))
+            return jsonify(status='ok', output_file=f'/final/{output_filename}', selected_count=len(selected_segments))
+        if any(segment.get('rendered') is False for segment in selected_segments):
+            return jsonify(status='error', message=SOURCE_UNAVAILABLE), 409
+
+        clips = []
+        for seg in selected_segments:
+            video_path = os.path.join(SEGMENTS_DIR, seg["filename"])
+            if os.path.exists(video_path):
+                clips.append(VideoFileClip(video_path))
+            else:
+                print(f"Warning: file not found {video_path}")
+
+        if clips:
+            final_clip = concatenate_videoclips(clips, method="compose")
+            output_filename = "highlight_reel.mp4"
+            output_path = os.path.join(HIGHLIGHTS_DIR, output_filename)
+            final_clip.write_videofile(output_path, codec="libx264", audio_codec="aac")
+            final_clip.close()
+            return jsonify({
+                "status": "ok",
+                "output_file": f"/final/{output_filename}",
+                "selected_count": len(clips)
+            })
         else:
-            print(f"Warning: file not found {video_path}")
+            return jsonify({"status": "error", "message": "No valid video clips found"}), 400
+    finally:
+        release_workspace(owner)
 
-    if clips:
-        final_clip = concatenate_videoclips(clips, method="compose")
-        output_filename = "highlight_reel.mp4"
-        output_path = os.path.join(HIGHLIGHTS_DIR, output_filename)
-        final_clip.write_videofile(output_path, codec="libx264", audio_codec="aac")
-        final_clip.close()
-        return jsonify({
-            "status": "ok",
-            "output_file": f"/final/{output_filename}",
-            "selected_count": len(clips)
-        })
-    else:
-        return jsonify({"status": "error", "message": "No valid video clips found"}), 400
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -182,7 +411,11 @@ def process_video_async(video_path, output_folder, task_id):
     """
     Process video by calling main.py as a subprocess.
     """
+    _paths = workspace_paths()
+    SEGMENTS_JSON = _paths['SEGMENTS_JSON']
+    UPLOAD_FOLDER = _paths['UPLOAD_FOLDER']
     global processing_status, active_pipeline_process
+    process = None
 
     try:
         # Task should already be registered, but update if not
@@ -237,7 +470,7 @@ def process_video_async(video_path, output_folder, task_id):
             main_script = os.path.join(script_dir, "main.py")
             if not os.path.exists(main_script):
                 raise Exception(f"main.py not found at {main_script}")
-            cmd = [sys.executable, main_script, video_path, "--output", output_folder]
+            cmd = [sys.executable, main_script, video_path, "--output", output_folder, "--defer-source-publication"]
         print(f"DEBUG: Running command: {' '.join(cmd)}")
         
         process = subprocess.Popen(
@@ -251,7 +484,8 @@ def process_video_async(video_path, output_folder, task_id):
             stderr=subprocess.STDOUT,
             encoding="utf-8",
             errors="replace",
-            bufsize=1
+            bufsize=1,
+            **pipeline_process_options()
         )
         active_pipeline_process = process
         
@@ -297,7 +531,7 @@ def process_video_async(video_path, output_folder, task_id):
                         "status": "processing",
                         "stage": "extracting_segments",
                         "progress": 70,
-                        "message": "Extracting video segments..."
+                        "message": "Preparing source ranges (no segment rendering)..."
                     }
                 elif "Step 5: Creating segment manifest" in line:
                     processing_status[task_id] = {
@@ -316,9 +550,9 @@ def process_video_async(video_path, output_folder, task_id):
                             segment_count = len(manifest.get("segments", []))
                             
                             processing_status[task_id] = {
-                                "status": "complete",
-                                "progress": 100,
-                                "message": "Processing complete!",
+                                "status": "processing",
+                                "progress": 99,
+                                "message": "Finalizing recording…",
                                 "segment_count": segment_count,
                                 "output_folder": output_folder
                             }
@@ -386,6 +620,15 @@ def process_video_async(video_path, output_folder, task_id):
                 segment_count = len(manifest.get("segments", []))
                 
                 print(f"DEBUG: Manifest found with {segment_count} segments")
+                # Source preview is optional: failed validation must never
+                # turn a successful legacy import/export into a failed job.
+                with SOURCE_LOCK:
+                    try:
+                        publish_source(output_folder, UPLOAD_FOLDER, video_path, task_id.removeprefix('task_'))
+                    except (OSError, ValueError) as error:
+                        app.logger.warning('Source preview unavailable: %s', error)
+                        if any(segment.get('rendered') is False for segment in manifest.get('segments', [])):
+                            raise ValueError('The original source could not be validated. Retry this import before editing or exporting.') from error
                 
                 if processing_status[task_id].get("status") != "complete":
                     processing_status[task_id] = {
@@ -431,11 +674,57 @@ def process_video_async(video_path, output_folder, task_id):
             "message": f"Processing failed: {str(e)}"
         }
 
+    finally:
+        finish_pipeline_process(process)
+
+@app.after_request
+def subtitle_cache_policy(response):
+    if request.path == "/api/subtitles" or request.path.startswith("/api/subtitles/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/api/subtitles", defaults={"format": None})
+@app.route("/api/subtitles/<format>")
+def subtitles(format):
+    _paths = workspace_paths()
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
+    if format is not None and format not in ("srt", "vtt"):
+        return jsonify(message="Unsupported subtitle format. Use srt or vtt."), 400
+    owner = acquire_workspace()
+    if owner is None:
+        return jsonify(available=False, message="Subtitles unavailable while processing. Please wait."), 409
+    try:
+        content = serialize_subtitles(read_current_transcript(MANIFEST_DIR), format or "srt")
+        if format is None:
+            response = jsonify(available=True, message="Original recording subtitles ready")
+        else:
+            response = Response(content.encode("utf-8"), content_type=(
+                "application/x-subrip" if format == "srt" else "text/vtt") + "; charset=utf-8")
+            response.headers["Content-Disposition"] = f'attachment; filename="original-recording.{format}"'
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except (FileNotFoundError, NoCaptions) as exc:
+        return jsonify(available=False, message=str(exc)), 404
+    except (ValueError, UnicodeError):
+        return jsonify(available=False, message="Invalid transcript timing or content. Import the recording again."), 422
+    except OSError:
+        return jsonify(available=False, message="Could not read current transcript."), 500
+    finally:
+        release_workspace(owner)
+
+
 @app.route("/api/upload", methods=["POST"])
 def upload_video():
     """
     Handle video upload and start processing
     """
+    _paths = workspace_paths()
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
+    SEGMENTS_JSON = _paths['SEGMENTS_JSON']
+    UPLOAD_FOLDER = _paths['UPLOAD_FOLDER']
+    owner = None
+    worker_started = False
     try:
         if 'video' not in request.files:
             return jsonify({"status": "error", "message": "No video file provided"}), 400
@@ -451,6 +740,18 @@ def upload_video():
                 "message": f"Invalid file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
             }), 400
         
+        owner = acquire_workspace()
+        if owner is None:
+            return workspace_busy()
+
+        if _current_project.get() and not can_import_recording():
+            return jsonify(status="error", message="This project already contains a recording. Create a new project to import another."), 409
+
+        # Fail closed before any replacement work, including upload/worker failures.
+        with SOURCE_LOCK:
+            invalidate_source(MANIFEST_DIR)
+            invalidate_transcript(MANIFEST_DIR)
+
         # Ensure upload folder exists with proper permissions
         upload_path = os.path.abspath(UPLOAD_FOLDER)
         try:
@@ -471,8 +772,10 @@ def upload_video():
         
         # Save uploaded file
         filename = secure_filename(file.filename)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_filename = f"{timestamp}_{filename}"
+        task_id = f"task_{uuid4().hex}"
+        _task_projects[task_id] = _current_project.get()
+        _cancel_events[task_id] = threading.Event()
+        unique_filename = f"{task_id.removeprefix('task_')}_{filename}"
         video_path = os.path.join(upload_path, unique_filename)
         
         # Ensure we're using absolute path
@@ -543,9 +846,6 @@ def upload_video():
                 "message": f"Failed to create output directory: {str(e)}"
             }), 500
         
-        # Generate task ID
-        task_id = f"task_{timestamp}"
-        
         # Register task immediately so status endpoint can find it
         processing_status[task_id] = {
             "status": "processing",
@@ -560,11 +860,12 @@ def upload_video():
         # Start processing in background thread
         try:
             processing_thread = threading.Thread(
-                target=process_video_async,
-                args=(video_path, output_folder, task_id)
+                target=run_workspace_job,
+                args=(owner, task_id, process_video_async, (video_path, output_folder, task_id))
             )
             processing_thread.daemon = True
             processing_thread.start()
+            worker_started = True
             print(f"DEBUG: Started processing thread for task {task_id}")
         except Exception as e:
             print(f"ERROR: Failed to start processing thread: {e}")
@@ -596,9 +897,18 @@ def upload_video():
             "message": f"Upload failed: {str(e)}"
         }), 500
 
+    finally:
+        if owner is not None and not worker_started:
+            release_workspace(owner)
+
 
 @app.route("/api/processing-status/<task_id>", methods=["GET"])
 def get_processing_status(task_id):
+    persisted = read_persisted_job(task_id)
+    if task_id not in processing_status and persisted is not None:
+        return jsonify(persisted)
+    if _current_project.get() and _task_projects.get(task_id) != _current_project.get():
+        return jsonify(status="error", message="Task not found in this project."), 404
     """
     Check processing status for a task
     """
@@ -621,6 +931,8 @@ def get_available_videos():
     """
     List all processed videos available for viewing
     """
+    _paths = workspace_paths()
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
     highlights_dir = MANIFEST_DIR
     videos = []
     
@@ -649,6 +961,8 @@ def get_available_videos():
 # Update the segments manifest endpoint to support different videos
 @app.route("/data/<video_id>/segments_manifest.json")
 def get_video_segments_json(video_id):
+    _paths = workspace_paths()
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
     manifest_path = os.path.join(MANIFEST_DIR, video_id, "segments_manifest.json")
     if not os.path.exists(manifest_path):
         return jsonify({"status": "error", "message": "Manifest not found"}), 404
@@ -661,6 +975,8 @@ def get_video_segments_json(video_id):
 # Update segments serving to support different videos
 @app.route("/segments/<video_id>/<filename>")
 def serve_video_segment(video_id, filename):
+    _paths = workspace_paths()
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
     segments_path = os.path.join(MANIFEST_DIR, video_id, "segments", filename)
     if not os.path.exists(segments_path):
         return jsonify({"status": "error", "message": "Segment not found"}), 404
@@ -670,36 +986,58 @@ def serve_video_segment(video_id, filename):
 
 
 def find_manifest_segment(highlight, segments_list):
-    """
-    Match a scored highlight to a manifest segment. Primary key is the
-    segment id (scoring preserves the transcription ids the manifest uses).
-    Falls back to closest start time — manifest starts are buffered, so use
-    a generous tolerance and pick the nearest rather than the first match.
-    """
-    sid = highlight.get("segment_id")
-    if sid is not None:
-        for seg in segments_list:
-            if str(seg.get("id")) == str(sid):
-                return seg
-
-    start_time = highlight.get("start_time")
-    if start_time is None:
+    """Resolve only an unambiguous exact canonical ID; never guess from timestamps."""
+    sid = llm_scoring.canonical_segment_id(highlight.get("segment_id"))
+    if sid is None:
         return None
-    best = None
-    for seg in segments_list:
-        diff = abs(seg.get("start", -999999) - start_time)
-        if diff < 1.5 and (best is None or diff < best[0]):
-            best = (diff, seg)
-    return best[1] if best else None
+    matches = [seg for seg in segments_list if isinstance(seg, dict)
+               and llm_scoring.canonical_segment_id(seg.get("transcript_id")) == sid]
+    return matches[0] if len(matches) == 1 else None
 
 
-def run_scoring_subprocess(task_id, instructions):
+def automatic_export_segments(manifest):
+    """Legacy clip indexes cannot establish transcript identity; require reimport."""
+    segments = manifest.get("segments", [])
+    if any(not isinstance(seg, dict) or
+           llm_scoring.canonical_segment_id(seg.get("transcript_id")) is None
+           for seg in segments):
+        raise ValueError("Clip manifest lacks canonical transcript identity. Import the recording again.")
+    return segments
+
+
+def current_scoring_segments():
+    """The scoring transcript is authoritative; the clip manifest is only for export."""
+    _paths = workspace_paths()
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
+    try:
+        with open(os.path.join(MANIFEST_DIR, "transcription.json"), "r", encoding="utf-8") as f:
+            transcript = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        raise llm_scoring.ScoringError("Current transcription.json could not be read. Process a video first.",
+                                       category="parse")
+    if not isinstance(transcript, dict):
+        raise llm_scoring.ScoringError("Current transcription.json must contain transcript segments.",
+                                       category="parse")
+    return transcript.get("segments")
+
+
+def load_validated_highlights(scored_path, instructions):
+    """All automatic disk consumers use the same identity and HL-A3a validation."""
+    segments = current_scoring_segments()
+    backend = llm_scoring.get_backend()
+    identity = llm_scoring.score_cache_identity(segments, instructions, backend)
+    return llm_scoring.load_score_cache(scored_path, segments, identity)
+
+
+def run_scoring_subprocess(task_id, instructions, settings=None, backend_name=None):
     """
     Run AI highlight scoring (model_based_processing/scoring.py) as a
     subprocess, mirroring how the video pipeline is spawned. Writes
     scored_segments.json + sorted_segments.json into the highlights folder.
     Returns True on success.
     """
+    _paths = workspace_paths()
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
     global active_pipeline_process
 
     transcript_path = os.path.join(MANIFEST_DIR, "transcription.json")
@@ -716,6 +1054,12 @@ def run_scoring_subprocess(task_id, instructions):
     # Same self-spawn rules as the video pipeline: cleaned env, no stdin.
     child_env = {k: v for k, v in os.environ.items()
                  if not k.startswith("_PYI") and k != "_MEIPASS2"}
+    if settings is not None:
+        # Pin the resolved request across the process boundary. Settings edits
+        # and a changed auto-detection probe cannot silently reroute this job.
+        for key in ("base_url", "api_key", "model", "local_url", "local_model"):
+            child_env["HI_LITE_LLM_" + key.upper()] = settings[key] or ""
+        child_env["HI_LITE_LLM_BACKEND"] = backend_name
 
     if getattr(sys, 'frozen', False):
         cmd = [sys.executable, "--score-highlights"] + args
@@ -733,63 +1077,67 @@ def run_scoring_subprocess(task_id, instructions):
         stderr=subprocess.STDOUT,
         encoding="utf-8",
         errors="replace",
-        bufsize=1
+        bufsize=1,
+        **pipeline_process_options()
     )
     active_pipeline_process = process
 
-    scoring_ok = False
-    last_error = None
-    for line in process.stdout:
-        line = line.rstrip()
-        if line:
-            print(f"[scoring] {line}")
-            if line.startswith("Trying "):
-                processing_status[task_id] = {
-                    "status": "processing", "stage": "scoring", "progress": 30,
-                    "message": f"Scoring with AI ({line[len('Trying '):]})..."
-                }
-            elif line.startswith("ERROR: "):
-                # scoring.py prints distinct, user-facing failure reasons
-                # (auth / rate limit / timeout / no backend configured / ...)
-                last_error = line[len("ERROR: "):]
-            elif "Scoring complete" in line:
-                scoring_ok = True
+    try:
+        scoring_ok = False
+        last_error = None
+        for line in process.stdout:
+            line = line.rstrip()
+            if line:
+                print(f"[scoring] {line}")
+                if line.startswith("Trying "):
+                    processing_status[task_id] = {
+                        "status": "processing", "stage": "scoring", "progress": 30,
+                        "message": f"Scoring with AI ({line[len('Trying '):]})..."
+                    }
+                elif line.startswith("ERROR: "):
+                    # scoring.py prints distinct, user-facing failure reasons
+                    # (auth / rate limit / timeout / no backend configured / ...)
+                    last_error = line[len("ERROR: "):]
+                elif "Scoring complete" in line:
+                    scoring_ok = True
 
-    return_code = process.wait()
-    active_pipeline_process = None
+        return_code = process.wait()
+        active_pipeline_process = None
 
-    if return_code != 0 or not scoring_ok:
-        processing_status[task_id] = {
-            "status": "error",
-            "message": last_error or "AI scoring failed. Check the app logs."
-        }
-        return False
-    return True
+        if return_code != 0 or not scoring_ok:
+            processing_status[task_id] = {
+                "status": "error",
+                "message": last_error or "AI scoring failed. Check the app logs."
+            }
+            return False
+        return True
+    finally:
+        finish_pipeline_process(process)
 
 
-def build_highlight_reel(min_score, sort_chronological):
+def build_highlight_reel(min_score, sort_chronological, instructions, highlights=None):
     """
     Build the highlight reel mp4 from sorted_segments.json.
     Returns the success payload dict; raises ValueError with a user-facing
     message on expected failures.
     """
+    _paths = workspace_paths()
+    HIGHLIGHTS_DIR = _paths['HIGHLIGHTS_DIR']
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
+    SEGMENTS_DIR = _paths['SEGMENTS_DIR']
+    SEGMENTS_JSON = _paths['SEGMENTS_JSON']
     scored_segments_path = os.path.join(MANIFEST_DIR, "sorted_segments.json")
     print(f"DEBUG: Looking for sorted_segments.json at: {scored_segments_path}")
 
     if not os.path.exists(scored_segments_path):
         raise ValueError("sorted_segments.json not found. Run AI scoring first.")
 
-    with open(scored_segments_path, "r", encoding="utf-8") as f:
-        scored_data = json.load(f)
-
-    highlights = scored_data.get("highlights", [])
+    if highlights is None:
+        highlights = load_validated_highlights(scored_segments_path, instructions)
     print(f"DEBUG: Total highlights loaded: {len(highlights)}")
 
-    if not highlights:
-        raise ValueError("No highlights found in sorted_segments.json")
-
     # Filter by score threshold
-    filtered_highlights = [h for h in highlights if h.get("score", 0) >= min_score]
+    filtered_highlights = [h for h in highlights if h["score"] >= min_score]
     print(f"DEBUG: Filtered highlights (score >= {min_score}): {len(filtered_highlights)}")
 
     if not filtered_highlights:
@@ -801,34 +1149,53 @@ def build_highlight_reel(min_score, sort_chronological):
 
     with open(SEGMENTS_JSON, "r", encoding="utf-8") as f:
         manifest = json.load(f)
-    segments_list = manifest.get("segments", [])
+    segments_list = automatic_export_segments(manifest)
     print(f"DEBUG: Total segments in manifest: {len(segments_list)}")
 
-    # Match highlights to clips, deduped by manifest segment id. The LLM can
-    # emit the same segment twice, and hallucinated ids can fall back to the
-    # same nearest clip — either would put identical footage in the reel
-    # twice. Source clips are cut non-overlapping, so unique ids in
-    # chronological order guarantee an overlap-free reel. Keep the
-    # best-scored duplicate.
-    matched = {}
+    # Scores are already validated and deduplicated. Manifest matching is exact
+    # because buffered clip timestamps are not transcript identities.
+    pairs = []
     for highlight in filtered_highlights:
         matching_segment = find_manifest_segment(highlight, segments_list)
         if not matching_segment:
-            print(f"WARNING: No matching segment for highlight at {highlight.get('start_time')}s")
+            print(f"WARNING: No unique manifest segment for ID {highlight['segment_id']}")
             continue
-        seg_id = matching_segment["id"]
-        if seg_id in matched and matched[seg_id][0].get("score", 0) >= highlight.get("score", 0):
-            print(f"DEBUG: Skipping duplicate highlight for segment {seg_id}")
-            continue
-        matched[seg_id] = (highlight, matching_segment)
-
-    pairs = list(matched.values())
+        pairs.append((highlight, matching_segment))
     if sort_chronological:
         # Sort by the manifest clip's actual start, not the LLM-reported time
         pairs.sort(key=lambda p: p[1].get("start", 0))
     else:
         # Sort by score (highest first)
-        pairs.sort(key=lambda p: p[0].get("score", 0), reverse=True)
+        pairs.sort(key=lambda p: p[0]["score"], reverse=True)
+
+    # All modern exports share the same source-range renderer.
+    try:
+        with SOURCE_LOCK:
+            source_path, _ = resolve_source(MANIFEST_DIR, _paths['UPLOAD_FOLDER'])
+    except ValueError:
+        source_path = None
+    if source_path is not None:
+        from media_editor import export_source_ranges
+        if not pairs:
+            raise ValueError('No valid source ranges found for the filtered highlights.')
+        output_id = uuid4().hex
+        output_filename = f'auto_highlights_score{min_score}_{output_id}.mp4'
+        output_path = os.path.join(HIGHLIGHTS_DIR, output_filename)
+        export_source_ranges(source_path, [segment for _, segment in pairs], output_path,
+                             cancel_event=_cancel_events.get(_active_task))
+        used = [dict(segment_id=highlight['segment_id'], text=highlight.get('text'), score=highlight.get('score'),
+                     reason=highlight.get('reason'), start_time=segment['start']) for highlight, segment in pairs]
+        metadata = dict(created_at=datetime.now().isoformat(), min_score=min_score,
+                        total_highlights_available=len(highlights), highlights_used=len(used),
+                        score_validation=highlights.validation, segments=used)
+        os.makedirs(SEGMENTS_DIR, exist_ok=True)
+        _atomic_write(Path(SEGMENTS_DIR, f'auto_highlights_metadata_{output_id}.json'),
+                      json.dumps(metadata, ensure_ascii=False).encode('utf-8'))
+        return dict(status='ok', output_file=f'/final/{output_filename}', highlights_used=len(used),
+                    total_available=len(highlights), score_validation=highlights.validation, min_score=min_score,
+                    file_size_mb=round(os.path.getsize(output_path) / 1024 ** 2, 2), segments_included=used)
+    if any(segment.get('rendered') is False for _, segment in pairs):
+        raise ValueError(SOURCE_UNAVAILABLE)
 
     # Build list of video file paths
     video_paths = []
@@ -842,7 +1209,7 @@ def build_highlight_reel(min_score, sort_chronological):
         if os.path.exists(video_path):
             video_paths.append(video_path)
             used_segments.append({
-                "segment_id": matching_segment["id"],
+                "segment_id": highlight["segment_id"],
                 "text": highlight.get("text"),
                 "score": highlight.get("score"),
                 "reason": highlight.get("reason"),
@@ -914,6 +1281,7 @@ def build_highlight_reel(min_score, sort_chronological):
         "min_score": min_score,
         "total_highlights_available": len(highlights),
         "highlights_used": len(used_segments),
+        "score_validation": highlights.validation,
         "segments": used_segments
     }
 
@@ -928,6 +1296,7 @@ def build_highlight_reel(min_score, sort_chronological):
         "output_file": f"/final/{output_filename}",
         "highlights_used": len(used_segments),
         "total_available": len(highlights),
+        "score_validation": highlights.validation,
         "min_score": min_score,
         "file_size_mb": file_size_mb,
         "segments_included": used_segments
@@ -939,39 +1308,47 @@ def auto_generate_async(task_id, min_score, sort_chronological, instructions, re
     Background task: optionally (re)run AI scoring, then build the reel.
     Progress/results land in processing_status[task_id] for the UI to poll.
     """
+    _paths = workspace_paths()
+    MANIFEST_DIR = _paths['MANIFEST_DIR']
     try:
-        # Reuse existing scores only if they were produced by this same prompt;
-        # a new prompt (or an explicit rescore) always re-runs scoring.
+        segments = current_scoring_segments()
+        settings = llm_scoring.get_llm_settings()
+        backend = llm_scoring.get_backend(settings=settings)
+        identity = llm_scoring.score_cache_identity(segments, instructions, backend)
         sorted_path = os.path.join(MANIFEST_DIR, "sorted_segments.json")
-        needs_scoring = True
-        if not rescore and os.path.exists(sorted_path):
+        highlights = None
+        if not rescore:
             try:
-                with open(sorted_path, "r", encoding="utf-8") as f:
-                    prev_instructions = (json.load(f).get("instructions") or "").strip()
-                needs_scoring = prev_instructions != instructions
-            except (json.JSONDecodeError, OSError):
+                highlights = llm_scoring.load_score_cache(sorted_path, segments, identity)
+            except llm_scoring.ScoringError:
                 pass
 
-        if needs_scoring:
+        if highlights is None:
             processing_status[task_id] = {
                 "status": "processing", "stage": "scoring", "progress": 10,
                 "message": "Scoring segments with AI (this can take a minute)..."
             }
-            if not run_scoring_subprocess(task_id, instructions):
+            if not run_scoring_subprocess(task_id, instructions, settings, backend.name):
                 return  # status already set to error
+            # Fresh partial results remain usable under HL-A3a. They will miss
+            # on subsequent automatic reuse; identity and payload still validate.
+            highlights = llm_scoring.load_score_cache(sorted_path, segments, identity,
+                                                       require_complete=False)
 
         processing_status[task_id] = {
             "status": "processing", "stage": "building_reel", "progress": 80,
             "message": "Building highlight reel..."
         }
-        payload = build_highlight_reel(min_score, sort_chronological)
+        payload = build_highlight_reel(min_score, sort_chronological, instructions, highlights)
         payload.update({
             "status": "complete", "progress": 100,
-            "message": "Highlight reel ready!"
+            "message": ("Highlight reel ready (partial AI scores)."
+                        if payload["score_validation"]["status"] == "partial"
+                        else "Highlight reel ready!")
         })
         processing_status[task_id] = payload
 
-    except (ValueError, RuntimeError) as e:
+    except (ValueError, RuntimeError, llm_scoring.ScoringError) as e:
         processing_status[task_id] = {"status": "error", "message": str(e)}
     except Exception as e:
         import traceback
@@ -1000,20 +1377,37 @@ def auto_export_highlights():
             "message": "Instructions are required - describe what counts as a highlight."
         }), 400
 
-    task_id = f"autogen_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    processing_status[task_id] = {
-        "status": "processing", "stage": "starting", "progress": 0,
-        "message": "Starting auto-generation..."
-    }
+    owner = acquire_workspace()
+    if owner is None:
+        return workspace_busy()
 
-    thread = threading.Thread(
-        target=auto_generate_async,
-        args=(task_id, min_score, sort_chronological, instructions, rescore)
-    )
-    thread.daemon = True
-    thread.start()
-
-    return jsonify({"status": "ok", "task_id": task_id})
+    task_id = None
+    worker_started = False
+    try:
+        task_id = f"autogen_{uuid4().hex}"
+        _task_projects[task_id] = _current_project.get()
+        _cancel_events[task_id] = threading.Event()
+        processing_status[task_id] = {
+            "status": "processing", "stage": "starting", "progress": 0,
+            "message": "Starting auto-generation..."
+        }
+        thread = threading.Thread(
+            target=run_workspace_job,
+            args=(owner, task_id, auto_generate_async,
+                  (task_id, min_score, sort_chronological, instructions, rescore))
+        )
+        thread.daemon = True
+        thread.start()
+        worker_started = True
+        return jsonify({"status": "ok", "task_id": task_id})
+    except Exception as e:
+        message = f"Failed to start auto-generation: {e}"
+        if task_id is not None:
+            processing_status[task_id] = {"status": "error", "message": message}
+        return jsonify({"status": "error", "message": message}), 500
+    finally:
+        if not worker_started:
+            release_workspace(owner)
 
 
 def _resolve_llm_state():
@@ -1150,33 +1544,43 @@ def discard_reel():
     Expects {"output_file": "/final/<name>.mp4"} (as returned by the
     export/auto-generate endpoints).
     """
-    data = request.json or {}
-    filename = os.path.basename(data.get("output_file") or "")
-    if not filename.endswith(".mp4"):
-        return jsonify({"status": "error", "message": "Invalid reel filename."}), 400
-
-    reel_path = os.path.join(HIGHLIGHTS_DIR, filename)
-    if not os.path.exists(reel_path):
-        return jsonify({"status": "error", "message": f"{filename} not found."}), 404
-
+    _paths = workspace_paths()
+    HIGHLIGHTS_DIR = _paths['HIGHLIGHTS_DIR']
+    SEGMENTS_DIR = _paths['SEGMENTS_DIR']
+    owner = acquire_workspace()
+    if owner is None:
+        return workspace_busy()
     try:
-        os.remove(reel_path)
-    except OSError as e:
-        return jsonify({"status": "error", "message": f"Could not delete reel: {e}"}), 500
+        data = request.json or {}
+        filename = os.path.basename(data.get("output_file") or "")
+        if not filename.endswith(".mp4"):
+            return jsonify({"status": "error", "message": "Invalid reel filename."}), 400
 
-    # Auto reels also wrote a metadata JSON keyed by the same timestamp.
-    match = re.fullmatch(r"auto_highlights_score\d+_(\d{8}_\d{6})\.mp4", filename)
-    if match:
-        metadata_path = os.path.join(
-            SEGMENTS_DIR, f"auto_highlights_metadata_{match.group(1)}.json"
-        )
+        reel_path = os.path.join(HIGHLIGHTS_DIR, filename)
+        if not os.path.exists(reel_path):
+            return jsonify({"status": "error", "message": f"{filename} not found."}), 404
+
         try:
-            if os.path.exists(metadata_path):
-                os.remove(metadata_path)
-        except OSError:
-            pass  # the reel itself is gone, which is what matters
+            os.remove(reel_path)
+        except OSError as e:
+            return jsonify({"status": "error", "message": f"Could not delete reel: {e}"}), 500
 
-    return jsonify({"status": "ok"})
+        # Auto reels also wrote a metadata JSON keyed by the same timestamp.
+        match = re.fullmatch(r"auto_highlights_score[\d.]+_([a-f0-9]{32}|\d{8}_\d{6})\.mp4", filename)
+        if match:
+            metadata_path = os.path.join(
+                SEGMENTS_DIR, f"auto_highlights_metadata_{match.group(1)}.json"
+            )
+            try:
+                if os.path.exists(metadata_path):
+                    os.remove(metadata_path)
+            except OSError:
+                pass  # the reel itself is gone, which is what matters
+
+        return jsonify({"status": "ok"})
+    finally:
+        release_workspace(owner)
+
 
 
 # Optional: Add an endpoint to preview what would be included
@@ -1187,7 +1591,10 @@ def preview_auto_export():
     Preview what will be included in auto-generated highlight reel
     Returns count and estimated duration without actually creating the video
     """
-    data = request.json
+    _paths = workspace_paths()
+    SEGMENTS_DIR = _paths['SEGMENTS_DIR']
+    SEGMENTS_JSON = _paths['SEGMENTS_JSON']
+    data = request.json or {}
     min_score = data.get("min_score", 7)
     
     # Path to your AI-scored highlights
@@ -1200,20 +1607,15 @@ def preview_auto_export():
             "message": "sorted_segments.json not found. Run AI scoring first."
         }), 404
     
-    # Load the scored highlights
-    with open(scored_segments_path, "r", encoding="utf-8") as f:
-        scored_data = json.load(f)
-    
-    highlights = scored_data.get("highlights", [])
-    
-    if not highlights:
-        return jsonify({
-            "status": "error", 
-            "message": "No highlights found in sorted_segments.json"
-        }), 400
+    # Disk contents must pass the same boundary as new provider output.
+    try:
+        highlights = load_validated_highlights(scored_segments_path, data.get("instructions"))
+    except llm_scoring.ScoringError as e:
+        return jsonify({"status": "error", "message": str(e), "category": e.category,
+                        "score_validation": e.diagnostics}), 400
     
     # Filter by score threshold
-    filtered_highlights = [h for h in highlights if h.get("score", 0) >= min_score]
+    filtered_highlights = [h for h in highlights if h["score"] >= min_score]
     
     if not filtered_highlights:
         return jsonify({
@@ -1230,22 +1632,32 @@ def preview_auto_export():
     
     with open(SEGMENTS_JSON, "r", encoding="utf-8") as f:
         manifest = json.load(f)
-    segments_list = manifest.get("segments", [])
-    
+    try:
+        segments_list = automatic_export_segments(manifest)
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+    try:
+        with SOURCE_LOCK:
+            resolve_source(_paths['MANIFEST_DIR'], _paths['UPLOAD_FOLDER'])
+        source_available = True
+    except ValueError:
+        source_available = False
+
+    # Source-time metadata is sufficient for modern imports; old workspaces
+    # without source ownership retain their existing file/probe behavior.
     # Calculate estimated duration using ffprobe
     total_duration = 0
     valid_clips = 0
     
-    seen_ids = set()
     for highlight in filtered_highlights:
         matching_segment = find_manifest_segment(highlight, segments_list)
 
-        # Skip duplicates so the preview matches what the reel will contain
-        if matching_segment and matching_segment["id"] in seen_ids:
-            continue
-
         if matching_segment:
-            seen_ids.add(matching_segment["id"])
+            if source_available:
+                total_duration += matching_segment['end'] - matching_segment['start']
+                valid_clips += 1
+                continue
             video_path = os.path.join(SEGMENTS_DIR, matching_segment["filename"])
             # Convert to absolute path
             video_path = os.path.abspath(video_path)
@@ -1289,9 +1701,128 @@ def preview_auto_export():
         "status": "ok",
         "count": valid_clips,
         "total_available": len(highlights),
+        "score_validation": highlights.validation,
         "estimated_duration_seconds": round(total_duration, 1),
         "min_score": min_score
     })
+
+
+@app.route('/api/cancel/<task_id>', methods=['POST'])
+def cancel_job(task_id):
+    if task_id not in processing_status or _task_projects.get(task_id) != _current_project.get():
+        return jsonify(status='error', message='Task not found in this project.'), 404
+    if processing_status[task_id].get('status') not in ('processing', 'cancelling'):
+        return jsonify(status='error', message='This operation has already finished.'), 409
+    _cancel_events.setdefault(task_id, threading.Event()).set()
+    if _active_task == task_id:
+        terminate_pipeline_process(active_pipeline_process)
+    return jsonify(status='cancelling', message='Cancellation requested. Waiting for the worker to stop.')
+
+
+from editor_api import register_editor_api
+register_editor_api(app, globals())
+from desktop_sources import register_desktop_sources
+register_desktop_sources(app, globals())
+
+
+@app.route('/api/projects', methods=['GET', 'POST'])
+def project_index():
+    try:
+        if request.method == 'GET':
+            return jsonify(projects=projects.list())
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            raise ValueError('Request body must be a JSON object.')
+        return jsonify(projects.create(data.get('name', 'Untitled project'))), 201
+    except (ValueError, OSError) as error:
+        return jsonify(status='error', message=str(error)), 400
+
+
+@app.route('/api/projects/<project_id>', methods=['GET', 'PUT'])
+def project_detail(project_id):
+    try:
+        if request.method == 'GET':
+            return jsonify(projects.get(project_id))
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            raise ValueError('Request body must be a JSON object.')
+        return jsonify(projects.save(project_id, data.get('revision'), data.get('state'), data.get('name')))
+    except ProjectConflict as error:
+        return jsonify(status='error', message=str(error)), 409
+    except FileNotFoundError as error:
+        return jsonify(status='error', message=str(error)), 404
+    except (ValueError, OSError) as error:
+        return jsonify(status='error', message=str(error)), 400
+
+
+@app.route('/api/projects/<project_id>/checkpoints', methods=['GET', 'POST'])
+@app.route('/api/projects/<project_id>/checkpoints/<checkpoint_id>', methods=['DELETE'])
+@app.route('/api/projects/<project_id>/checkpoints/<checkpoint_id>/restore', methods=['POST'])
+def project_checkpoints(project_id, checkpoint_id=None):
+    owner = None
+    try:
+        if request.method == 'GET':
+            return jsonify(checkpoints=projects.list_checkpoints(project_id))
+        owner = acquire_workspace()
+        if owner is None:
+            return workspace_busy()
+        if request.method == 'DELETE':
+            projects.delete_checkpoint(project_id, checkpoint_id)
+            return jsonify(status='deleted')
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            raise ValueError('Request body must be a JSON object.')
+        if checkpoint_id:
+            return jsonify(projects.restore_checkpoint(project_id, checkpoint_id, data.get('revision')))
+        return jsonify(projects.create_checkpoint(project_id, data.get('revision'), data.get('name'))), 201
+    except ProjectConflict as error:
+        return jsonify(status='error', message=str(error), conflict=True), 409
+    except FileNotFoundError as error:
+        return jsonify(status='error', message=str(error)), 404
+    except (ValueError, OSError) as error:
+        return jsonify(status='error', message=str(error)), 400
+    finally:
+        if owner is not None:
+            release_workspace(owner)
+
+
+def project_route(view):
+    @wraps(view)
+    def scoped(project_id, **kwargs):
+        try:
+            projects.get(project_id)
+        except FileNotFoundError as error:
+            return jsonify(status='error', message=str(error)), 404
+        except (ValueError, OSError) as error:
+            return jsonify(status='error', message=str(error)), 400
+        token = _current_project.set(project_id)
+        try:
+            response = app.make_response(view(**kwargs))
+            if response.is_json:
+                def scope(value):
+                    if isinstance(value, dict):
+                        return {key: scope(item) for key, item in value.items()}
+                    if isinstance(value, list):
+                        return [scope(item) for item in value]
+                    if isinstance(value, str) and value.startswith(('/api/source/', '/segments/', '/final/')):
+                        return f'/api/projects/{project_id}' + value
+                    return value
+                response.set_data(app.json.dumps(scope(response.get_json())))
+            response.headers['Cache-Control'] = 'no-store'
+            return response
+        finally:
+            _current_project.reset(token)
+    return scoped
+
+
+# Explicit aliases preserve existing legacy clients without changing global paths.
+_project_views = {}
+for _rule in list(app.url_map.iter_rules()):
+    if _rule.rule.startswith(('/data/', '/segments/', '/final/', '/api/')) and not _rule.rule.startswith(('/api/projects', '/api/llm-', '/api/desktop/')):
+        app.add_url_rule('/api/projects/<project_id>' + _rule.rule,
+                         endpoint='project_' + _rule.endpoint,
+                         view_func=_project_views.setdefault(_rule.endpoint, project_route(app.view_functions[_rule.endpoint])),
+                         methods=_rule.methods, defaults=_rule.defaults)
 
 
 @app.route('/', defaults={'path': ''})

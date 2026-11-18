@@ -1,4 +1,6 @@
-import { app, BrowserWindow, shell } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
+import { randomBytes } from 'node:crypto';
+import { createSourceLinker, trustedAppUrl } from './source-linking.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync, ChildProcessWithoutNullStreams } from 'node:child_process';
@@ -14,6 +16,27 @@ let backendProcess: ChildProcessWithoutNullStreams | null = null;
 
 const BACKEND_PORT = 8000;
 const isDev = !app.isPackaged;
+// This capability never enters the renderer or preload. Browser-only instances
+// have no token and cannot use the filesystem-selection endpoints.
+const desktopToken = randomBytes(32).toString('hex');
+const startUrl = isDev ? 'http://localhost:5173/' : `http://127.0.0.1:${BACKEND_PORT}/`;
+const chooseOriginal = createSourceLinker({
+  getWindow: () => mainWindow,
+  appUrl: startUrl,
+  backendUrl: `http://127.0.0.1:${BACKEND_PORT}`,
+  desktopToken,
+  showOpenDialog: (window, options) => dialog.showOpenDialog(window, options),
+});
+
+function openExternalLink(value: string): void {
+  try {
+    const url = new URL(value);
+    if (url.protocol === 'https:' || url.protocol === 'http:') void shell.openExternal(url.href);
+  } catch { /* Ignore malformed links and local/custom protocols. */ }
+}
+
+ipcMain.handle('hi-lite:link-project', (event, projectId: unknown) => chooseOriginal(event, projectId, false));
+ipcMain.handle('hi-lite:relink-project', (event, projectId: unknown) => chooseOriginal(event, projectId, true));
 
 function resolveBackendExecutable(): { cmd: string; args: string[] } {
   const resourcesBase = process.resourcesPath;
@@ -47,6 +70,7 @@ async function startBackend(): Promise<void> {
     // Backend exits when its stdin pipe hits EOF (i.e. this process died),
     // covering crashes and force-kills where our quit handlers never run.
     HI_LITE_WATCHDOG: '1',
+    HI_LITE_DESKTOP_TOKEN: desktopToken,
   };
 
   if (!isDev) {
@@ -99,24 +123,25 @@ async function createWindow(): Promise<void> {
     webPreferences: {
       contextIsolation: true,
       sandbox: true,
+      nodeIntegration: false,
+      preload: path.join(hereDir, 'preload.cjs'),
     },
     show: false,
   });
 
   mainWindow.once('ready-to-show', () => mainWindow?.show());
 
-  // In development, use Vite dev server
-  // In production, load from Flask backend
-  const startUrl = isDev
-    ? 'http://localhost:5173'  // Vite dev server
-    : `http://127.0.0.1:${BACKEND_PORT}/`;  // Flask serves frontend in production
-
-  await mainWindow.loadURL(startUrl);
-
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    openExternalLink(url);
     return { action: 'deny' };
   });
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (!trustedAppUrl(url, startUrl)) {
+      event.preventDefault();
+      openExternalLink(url);
+    }
+  });
+  await mainWindow.loadURL(startUrl);
 
   mainWindow.on('closed', () => {
     mainWindow = null;

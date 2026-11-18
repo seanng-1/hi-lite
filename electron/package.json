@@ -8,7 +8,8 @@
     "dev": "concurrently -k \"tsc -w -p tsconfig.json\" \"wait-on dist/main.js && electron .\"",
     "build": "tsc -p tsconfig.json",
     "start": "electron .",
-    "dist": "electron-builder --win nsis"
+    "dist": "electron-builder --win nsis",
+    "test": "npm run build && node --test tests/*.test.mjs"
   },
   "dependencies": {
     "tree-kill": "^1.2.2",

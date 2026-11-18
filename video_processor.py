@@ -83,6 +83,37 @@ def get_smart_buffer(segment, prev_segment, next_segment, video_duration):
     return start_time, end_time
 
 
+def build_segment_metadata(video_path, transcription_data, output_folder=None, *, video_duration=None):
+    """Build the editing manifest without rendering individual segment files.
+
+    Keep the exact midpoint/smart-buffer algorithm used by legacy extraction.
+    Numeric clip IDs remain separate from stable transcript IDs. ``filename``
+    is retained for old manifest consumers, but ``rendered=False`` and ``path``
+    being null explicitly mean that playback/export must use the original.
+    ``video_duration`` is injectable for callers that already probed the source.
+    """
+    from media_editor import probe_source
+
+    segments = (transcription_data or {}).get("segments", [])
+    if not segments:
+        return []
+    if video_duration is None:
+        video_duration = probe_source(video_path)["duration"]
+    result = []
+    for index, segment in enumerate(segments):
+        start, end = get_smart_buffer(segment, segments[index - 1] if index else None,
+                                     segments[index + 1] if index + 1 < len(segments) else None,
+                                     video_duration)
+        text = segment.get("text", "").strip()
+        if not text or start >= video_duration or end <= start:
+            continue
+        result.append({"id": index, "transcript_id": segment.get("id"),
+                       "filename": f"segment_{index:03d}.mp4", "path": None,
+                       "start": start, "end": end, "duration": end - start,
+                       "text": text, "score": segment.get("score", 0), "rendered": False})
+    return result
+
+
 def extract_all_segments_alternative(video_path, transcription_data, output_folder):
     """
     Alternative segment extraction using direct FFmpeg calls to avoid MoviePy issues.
@@ -174,6 +205,7 @@ def extract_all_segments_alternative(video_path, transcription_data, output_fold
             if result.returncode == 0 and os.path.exists(segment_path) and os.path.getsize(segment_path) > 0:
                 segment_files.append({
                     "id": i,
+                    "transcript_id": segment.get("id"),
                     "filename": segment_filename,
                     "path": segment_path,
                     "start": start_time,
@@ -351,6 +383,7 @@ def extract_all_segments(video_path, transcription_data, output_folder):
                     if success and os.path.exists(segment_path) and os.path.getsize(segment_path) > 0:
                         segment_files.append({
                             "id": i,
+                            "transcript_id": segment.get("id"),
                             "filename": segment_filename,
                             "path": segment_path,
                             "start": start_time,
@@ -469,29 +502,16 @@ def create_highlight_reel_from_selection(video_input_path, selection_file_path, 
         # Sort by original order (by segment ID)
         selected_segments.sort(key=lambda x: x["id"])
         
-        # Get paths to selected segment files and verify they exist
-        selected_paths = []
-        for s in selected_segments:
-            if os.path.exists(s["path"]) and os.path.getsize(s["path"]) > 0:
-                selected_paths.append(s["path"])
-            else:
-                print(f"Warning: Segment file missing or empty: {s['path']}")
-        
-        if not selected_paths:
-            print("No valid segment files found for selection.")
-            return
-        
-        # Create output path
+        # Export directly from the original recording. This works for both
+        # metadata-only manifests and older rendered-segment manifests.
+        from media_editor import export_source_ranges
         timestamp = selection.get("timestamp", "").replace(":", "-").replace(".", "-")[:19]
         output_filename = f"highlight_reel_{timestamp}.mp4"
         output_path = os.path.join(output_folder, output_filename)
-        
-        print(f"Creating highlight reel with {len(selected_paths)} segments...")
-        print(f"Total duration: {selection.get('total_duration', 0):.1f}s")
-        
-        # Stitch the videos
-        stitch_videos(selected_paths, output_path)
-        
+        print(f"Creating highlight reel with {len(selected_segments)} segments...")
+        export_source_ranges(video_input_path, selected_segments, output_path,
+                             captions=selection.get("captions"), settings=selection.get("settings"))
+
         return output_path
         
     except Exception as e:

@@ -5,24 +5,29 @@ Updated to use modular structure.
 import os
 import sys
 import json
+from transcript_store import invalidate_transcript, publish_transcript
 from datetime import datetime
+from pathlib import Path
+from uuid import uuid4
 
 # Windows consoles/pipes default to cp1252, which cannot encode transcript
 # text and would kill the process with UnicodeEncodeError. Force UTF-8.
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         _stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
-from video_processor import extract_audio, extract_all_segments
+from video_processor import extract_audio, extract_all_segments, build_segment_metadata
 from transcription_client import transcribe_audio
 from highlight_analyzer import export_segments_to_excel, save_segment_manifest, find_highlights_from_segments
 
 
-def main(video_input_path, output_folder="highlights", final_output_name="highlight_reel.mp4"):
+def main(video_input_path, output_folder="highlights", final_output_name="highlight_reel.mp4", *, render_segments=False, publish_original=False):
     """
     Main processing function for video highlights.
     """
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
+
+    invalidate_transcript(output_folder)
 
     audio_output_path = os.path.join(output_folder, "extracted_audio.wav")
 
@@ -58,16 +63,20 @@ def main(video_input_path, output_folder="highlights", final_output_name="highli
     json_path = os.path.join(output_folder, "transcription.json")
     xlsx_path = os.path.join(output_folder, "transcription.xlsx")
     
-    with open(json_path, "w") as f:
-        json.dump(transcription, f, indent=4)
+    publish_transcript(output_folder, transcription)
     print(f"Transcription saved to {json_path}")
 
     export_segments_to_excel(transcription, xlsx_path)
     print()
 
-    # 4. Extract all segments as video files
+    # Keep this phase string for existing server status parsers. The default is
+    # metadata-only: original-source preview/export do not need eager clips.
     print("Step 4: Extracting video segments...")
-    segment_files = extract_all_segments(video_input_path, transcription, output_folder)
+    if render_segments:
+        segment_files = extract_all_segments(video_input_path, transcription, output_folder)
+    else:
+        print("Preparing source-range metadata (no segment rendering)...")
+        segment_files = build_segment_metadata(video_input_path, transcription, output_folder)
     
     if not segment_files:
         print("ERROR: No segments extracted. Exiting.")
@@ -81,6 +90,19 @@ def main(video_input_path, output_folder="highlights", final_output_name="highli
     save_segment_manifest(segment_files, output_folder)
     print()
 
+    # Standalone CLI imports must also retain a validated source reference now
+    # that clips are not rendered eagerly. Server imports defer publication to
+    # the admitted parent, which owns the task/source identity.
+    if publish_original:
+        from source_preview import SOURCE_LOCK, prepare_external_source, publish_source
+        with SOURCE_LOCK:
+            source_id = uuid4().hex
+            original = Path(video_input_path).resolve()
+            uploads = Path(output_folder).resolve().parent / 'uploads'
+            if original.parent != uploads:
+                prepare_external_source(output_folder, str(original), source_id)
+            publish_source(output_folder, uploads, original, source_id)
+
     # Summary
     #TODO: Edit the last few steps here. This main function now handles all the initial processing
     # the user then needs to make selections via the UI to send new HTTP requests to finish creating highlights/download.
@@ -93,7 +115,10 @@ def main(video_input_path, output_folder="highlights", final_output_name="highli
     print("3. Export the stitched reel from the UI")
     print()
     print(f"All files saved in: {output_folder}/")
-    print(f"Video segments in: {output_folder}/segments/")
+    if render_segments:
+        print(f"Video segments in: {output_folder}/segments/")
+    else:
+        print("Clips will be rendered from the original recording when exported.")
 
 
 def process_selection_file(selection_file_path, video_input_path=None, output_folder="highlights"):
@@ -147,7 +172,10 @@ if __name__ == "__main__":
     parser.add_argument("--output", "-o", default="highlights", help="Output folder")
     parser.add_argument("--create-reel", help="Create highlight reel from selection file")
     parser.add_argument("--video-path", help="Video path for creating reel (if different)")
+    parser.add_argument("--render-segments", action="store_true", help="Legacy mode: eagerly render every segment")
     
+    parser.add_argument("--defer-source-publication", action="store_true", help=argparse.SUPPRESS)
+
     args = parser.parse_args()
     
     if args.create_reel:
@@ -166,4 +194,5 @@ if __name__ == "__main__":
             print("Please provide a valid video file path.")
             exit(1)
         
-        main(args.video, args.output)
+        main(args.video, args.output, render_segments=args.render_segments,
+             publish_original=not args.defer_source_publication)

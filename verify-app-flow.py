@@ -16,6 +16,13 @@ import sys
 import time
 import urllib.request
 
+if "--contracts" in sys.argv:
+    import unittest
+    suite = unittest.defaultTestLoader.discover(
+        os.path.join(os.path.dirname(__file__), "tests"), pattern="test_manifest_contracts.py")
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    sys.exit(0 if result.wasSuccessful() else 1)
+
 BASE = os.environ.get("HI_LITE_BUILD_DIR",
                       os.path.join(os.path.expanduser("~"), "hi-lite-build"))
 PORT = "8040"
@@ -57,6 +64,11 @@ else:
     print("FAIL: server never came up"); sys.exit(1)
 print("server up")
 
+# This data directory starts clean on the first verification run.
+with urllib.request.urlopen(f"{URL}/data/segments_manifest.json") as r:
+    initial_manifest = json.load(r)
+assert isinstance(initial_manifest["segments"], list)
+
 up = subprocess.run(["curl.exe", "-s", "-X", "POST", "-F",
                      f"video=@{os.path.join(BASE, 'test.mp4')}",
                      f"{URL}/api/upload"],
@@ -79,6 +91,11 @@ with urllib.request.urlopen(f"{URL}/data/segments_manifest.json") as r:
     manifest = json.load(r)
 n = len(manifest["segments"])
 print(f"UI manifest endpoint: {n} segments")
+assert n > 0
+assert all(type(segment.get("is_keyword")) is bool for segment in manifest["segments"])
+assert {segment["id"] for segment in manifest["segments"] if segment["is_keyword"]} == {
+    segment["id"] for segment in manifest["keyword_highlights"]
+}
 
 first = manifest["segments"][0]["filename"]
 with urllib.request.urlopen(f"{URL}/segments/{first}") as r:

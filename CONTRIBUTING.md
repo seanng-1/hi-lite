@@ -11,11 +11,25 @@ Windows-packaging landmines that have each caused a real release failure.
    built frontend, upload/status/export APIs, and clip files.
 3. **Pipeline child** — on upload, the server re-invokes *its own executable* as
    `backend.exe --process-video ...` (in dev: `python main.py`). Pipeline:
-   extract audio → transcribe (faster-whisper, word timestamps) → cut one mp4 per
-   segment (ffmpeg) → write `segments_manifest.json`.
+   extract audio → transcribe (faster-whisper, word timestamps) → create buffered
+   source-range metadata → write `segments_manifest.json`. No per-segment render
+   is required; `--render-segments` preserves the old CLI behavior.
 
-The frontend (`web/src/selector.ts`) reads only the root manifest
-`/data/segments_manifest.json`; a new upload replaces previous results.
+The frontend (`web/src/selector.ts`, `projects.ts`, `transcript-editor.ts`) uses
+`/api/projects/<id>` for revision-checked project state and prefixes existing
+media/API paths with that project scope. `project_store.py` publishes atomic
+JSON with compare-and-swap revisions; `editor_api.py` validates edits and launches
+jobs. Existing unscoped routes retain the original single-workspace layout.
+Legacy adoption references that layout without copying/moving source files.
+Never mutate module-level workspace paths: request ContextVars and explicitly
+inherited worker context are what isolate projects.
+
+`edit_model.py` owns immutable source-time edit snapshots and reviewable suggestions.
+`media_editor.py` is the shared source-range renderer for manual, AI and editor
+exports. It validates cut order/timing, crops, remaps captions and stages outputs
+atomically; cancellation must reap the subprocess before releasing admission.
+`desktop_sources.py` permits external-file linking only through the token-protected
+Electron main-process native picker, never renderer-supplied arbitrary paths.
 
 **Auto-Generate** POSTs `/api/auto-generate`; the server runs the LLM scorer
 (`model_based_processing/scoring.py`) as a subprocess, then stitches clips whose score
@@ -89,7 +103,48 @@ endpoint — a commercial provider, an aggregator, or a self-hosted gateway.
 If a provider needs its own client library instead, implement a `ScoringBackend` subclass
 in `model_based_processing/scoring.py` (one `score(segments, transcript, instructions)`
 method; reuse `build_prompt` / `extract_scored_segments` / `enrich_results`) and register
-it in `get_backend()`. Two rules for any such integration:
+it in `get_backend()`. Call `enrich_results()` on the parsed records before any
+sorting or selection. It validates exact transcript IDs, accepts finite JSON
+numbers in the inclusive 1-10 range (strings and booleans are rejected), and
+keeps the highest valid score per ID. The first occurrence fixes ordering;
+the first record wins equal-score ties. Its `ScoringResult` is list-compatible
+and carries bounded `validation` diagnostics: complete/partial coverage,
+missing IDs (up to ten, with a total count), rejection counts/record indexes,
+and duplicate counts. No usable records raises `ScoringError`.
+
+The existing score files keep these diagnostics in a `validation` field.
+They also keep a small `cache` envelope with an identity and completeness flag.
+`score_cache_identity()` uses the ordered `transcription.json` segments (canonical
+IDs, stripped request text, source start/end times), stripped criteria, resolved
+backend/provider, effective model, nonsecret endpoint, and `SCORING_PROMPT_VERSION`.
+Bump that constant beside `build_prompt()` whenever scoring semantics change.
+Threshold, ordering, export controls, and credentials are outside the identity.
+
+`load_score_cache()` is the shared applicability check for preview and generation;
+it revalidates highlights through `enrich_results()` and verifies actual completeness.
+Legacy, mismatching, corrupt, and incomplete caches miss without migration or deletion.
+Fresh partial scores remain usable for the admitted generation job, with omitted
+segments excluded, but cannot be automatically reused by a later job or preview.
+Explicit rescore bypasses the cache. Score files publish through temporary files and
+atomic replacement; `sorted_segments.json` is the authoritative cache published last.
+
+Identity uses the backend's existing `name`, `model`, optional string `provider`, and
+optional `base_url` request attributes after defaults and routing resolve. A backend
+without a stable effective model can still score, but its results cannot be reused
+automatically (including dynamically routed development extensions). The subprocess
+receives the resolved settings and backend choice so a second auto-detection probe or
+settings edit cannot change the admitted request. Endpoint identity preserves path
+case and internal slashes, removes embedded credentials, and omits URL queries and
+fragments because they can contain untyped secrets. Known credential-only query fields
+allow reuse; any unknown query fields disable automatic reuse, since their values may
+alter routing and cannot safely be persisted. This eligibility flag is checked against
+the current endpoint, not trusted from disk. Never serialize the full settings
+dictionary into score metadata or diagnostic output.
+API/local request paths are appended before query parameters, keeping credential-only
+URL variations consistent with the nonsecret endpoint identity. Preview requests must
+send the current `instructions`, just as generation requests do.
+
+Two rules for any such integration:
 
 1. **Its library must never be installed automatically.** Do not add it to
    `requirements-backend.txt`, `requirements.txt`, the Docker images, or
@@ -129,8 +184,17 @@ to another backend.
 ## PRs
 
 - Branch from `main`; CI must pass (it builds the Windows installer).
-- No test suite yet — describe how you verified your change; packaging changes
-  need a `verify-app-flow.py` run.
+- Run the API/manifest checks with `python verify-app-flow.py --contracts`.
+  Run backend checks with
+  `python -m unittest discover -s tests -v`; scoring provider calls are stubbed.
+  Run `python tests/smoke_score_cache.py` for real scoring-subprocess and ffmpeg
+  coverage of scoring, reuse, transcript invalidation, and threshold-only reuse.
+  Run project-state checks with `cd web && npm run test:projects`, deterministic
+  DOM/API checks with `npm run test:dom` (uses the test-only jsdom dependency),
+  and the full built UI browser suite with `npm test`; install Chromium or set
+  `CHROME_BIN` to its executable. The Chromium suite uses no browser automation test dependency. DOM tests stub
+  media/layout and do not replace real browser playback or visual checks.
+  Packaging changes also need the Windows `verify-app-flow.py` run.
 - Keep pipeline prints ASCII; don't break the status-parser strings.
 - Contributions are accepted under the project license (GPL-3.0-or-later).
 

@@ -6,12 +6,16 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "test": "npm run test:dom && node verify-projects.mjs && node verify-selector.mjs",
+    "test:projects": "node verify-projects.mjs",
+    "preview": "vite preview",
+    "test:dom": "npm run build && node verify-project-ui.mjs && node verify-desktop-ui.mjs && node verify-editor-dom.mjs && node verify-cancellation-ui.mjs"
   },
   "keywords": [],
   "author": "",
   "license": "GPL-3.0-or-later",
   "devDependencies": {
+    "jsdom": "26.1.0",
     "typescript": "^5.9.2",
     "vite": "^7.1.5"
   }

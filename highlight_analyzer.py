@@ -143,13 +143,19 @@ def save_segment_manifest(segment_files, output_folder):
     Save segment information as JSON manifest for the web interface.
     """
     manifest_path = os.path.join(output_folder, "segments_manifest.json")
+
+    keyword_ids = {segment["id"] for segment in find_highlights_from_segments(segment_files)}
+    segments = [
+        {**segment, "is_keyword": segment["id"] in keyword_ids}
+        for segment in segment_files
+    ]
     
     # Convert segment info to JSON-serializable format
     manifest_data = {
-        "segments": segment_files,
-        "total_segments": len(segment_files),
-        "total_duration": sum(s["duration"] for s in segment_files),
-        "keyword_highlights": find_highlights_from_segments(segment_files)
+        "segments": segments,
+        "total_segments": len(segments),
+        "total_duration": sum(s["duration"] for s in segments),
+        "keyword_highlights": [segment for segment in segments if segment["is_keyword"]]
     }
     
     with open(manifest_path, "w") as f:

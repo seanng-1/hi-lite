@@ -26,7 +26,7 @@ echo "==> 1/5 Building web UI (Vite)"
 
 echo "==> 2/5 Syncing sources to $BUILD_WIN"
 mkdir -p "$BUILD_WSL/web" "$BUILD_WSL/bin" "$BUILD_WSL/electron"
-cp "$REPO"/{web_interface,main,video_processor,transcription_client,local_transcriber,highlight_analyzer}.py \
+cp "$REPO"/{web_interface,main,subtitle_serializer,transcript_store,source_preview,project_store,edit_model,editor_api,media_editor,desktop_sources,video_processor,transcription_client,local_transcriber,highlight_analyzer}.py \
    "$REPO/backend.spec" "$REPO/requirements-backend.txt" "$REPO/verify-app-flow.py" "$BUILD_WSL/"
 rm -rf "$BUILD_WSL/model_based_processing"
 cp -r "$REPO/model_based_processing" "$BUILD_WSL/model_based_processing"

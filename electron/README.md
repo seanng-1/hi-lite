@@ -102,3 +102,24 @@ give it a few minutes. Set `WHISPER_MODEL=tiny` for a quicker smoke test.
 - Models/uploads/highlights live in `%APPDATA%\Hi-Lite` (Electron userData).
 - The backend binds to 127.0.0.1 in production, which avoids the Windows
   Firewall prompt.
+
+## Linked original recordings (desktop only)
+
+The desktop Import screen can link an original video in place instead of copying
+it into the uploads directory. Keep that original unchanged. If it is moved,
+use **Relink original** in Media and choose an unchanged copy of the same file;
+SHA-256 content verification prevents associating edits with a different video.
+Linking hashes the source in bounded memory, so very large recordings can take a
+moment before transcription starts. Relinking does not retranscribe the source.
+
+The sandboxed preload exposes only `linkProject(projectId)` and
+`relinkProject(projectId)`. The main process verifies the originating app window
+and top-level frame, owns the native picker, and sends the path directly to
+Flask with a random per-launch `HI_LITE_DESKTOP_TOKEN`. The token is never exposed
+to the renderer. Browser-only servers cannot call these endpoints. Missing or
+modified original files fail closed; no arbitrary path-read endpoint is added.
+
+Run `npm test` from `electron/` for TypeScript compilation plus headless tests of
+the preload allowlist, trusted main-frame checks, picker cancellation/navigation,
+private-token requests, and relink responses. Native picker/window behavior and
+the packaged Windows executable still require the normal desktop smoke test.
